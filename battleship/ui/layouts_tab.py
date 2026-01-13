@@ -342,9 +342,11 @@ class LayoutsTab(QtWidgets.QWidget):
         form.addRow("Name", self.name_input)
         self.board_spin = QtWidgets.QSpinBox()
         self.board_spin.setRange(4, 20)
+        self.board_spin.valueChanged.connect(self._update_layout_summary)
         form.addRow("Board size", self.board_spin)
         self.touch_cb = QtWidgets.QCheckBox("Allow ships to touch")
         self.touch_cb.setChecked(True)
+        self.touch_cb.toggled.connect(lambda _checked: self._update_layout_summary())
         form.addRow("", self.touch_cb)
         right_layout.addLayout(form)
 
@@ -385,6 +387,11 @@ class LayoutsTab(QtWidgets.QWidget):
         action_row.addStretch(1)
         right_layout.addLayout(action_row)
 
+        self.summary_label = QtWidgets.QLabel("")
+        self.summary_label.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+        self.summary_label.setWordWrap(True)
+        right_layout.addWidget(self.summary_label)
+
         self.status_label = QtWidgets.QLabel("")
         self.status_label.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
         self.status_label.setWordWrap(True)
@@ -419,6 +426,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.touch_cb.setChecked(True)
         self.ship_specs = []
         self._refresh_ship_table()
+        self._update_layout_summary()
         self.status_label.setText("Create a new layout or copy the active one.")
 
     def _refresh_ship_table(self):
@@ -439,6 +447,24 @@ class LayoutsTab(QtWidgets.QWidget):
             for col, val in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(val)
                 self.ship_table.setItem(row, col, it)
+        self._update_layout_summary()
+
+    def _update_layout_summary(self):
+        board_size = int(self.board_spin.value())
+        total_cells = 0
+        for spec in self.ship_specs:
+            if spec.kind == "line":
+                total_cells += int(spec.length or 0)
+            else:
+                total_cells += len(spec.cells or [])
+        area = board_size * board_size
+        touching = "allowed" if self.touch_cb.isChecked() else "disallowed"
+        note = ""
+        if total_cells > area:
+            note = " (too many cells)"
+        self.summary_label.setText(
+            f"Ships: {len(self.ship_specs)} | Ship cells: {total_cells}/{area}{note} | Touching: {touching}"
+        )
 
     def _on_layout_selected(self, row: int):
         if row < 0 or row >= len(self.custom_layouts):
@@ -450,6 +476,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.touch_cb.setChecked(layout.allow_touching)
         self.ship_specs = list(layout.ships)
         self._refresh_ship_table()
+        self._update_layout_summary()
         self.status_label.setText(f"Editing {layout.name} (v{layout.layout_version})")
 
     def _add_ship(self, kind: str):
