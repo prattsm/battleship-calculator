@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+battleship_*_state.json
+battleship_stats.json
+battleship_app_state.json
