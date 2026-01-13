@@ -4,3 +4,5 @@ __pycache__/
 battleship_*_state.json
 battleship_stats.json
 battleship_app_state.json
+battleship_model_stats.json
+battleship_custom_layouts.json

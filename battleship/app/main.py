@@ -5,9 +5,11 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from battleship.layouts import DEFAULT_PLACEMENT_CACHE, LayoutDefinition, builtin_layouts, classic_layout
 from battleship.persistence.app_state import load_selected_layout, save_selected_layout
+from battleship.persistence.layouts_store import is_custom_layout_id, load_custom_layouts
 from battleship.persistence.stats import StatsTracker
 from battleship.ui.attack_tab import AttackTab
 from battleship.ui.defense_tab import DefenseTab
+from battleship.ui.layouts_tab import LayoutsTab
 from battleship.ui.model_stats_tab import ModelStatsTab
 from battleship.ui.theme import Theme
 from battleship.utils import debug
@@ -53,7 +55,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1250, 700)
 
         self.stats = StatsTracker()
-        self.layouts = list(builtin_layouts())
+        self.custom_layouts = load_custom_layouts()
+        self.layouts = list(builtin_layouts()) + list(self.custom_layouts)
         self.layout_definition = self._resolve_layout_selection(self.layouts)
         self.layout_runtime = DEFAULT_PLACEMENT_CACHE.get(self.layout_definition)
 
@@ -98,7 +101,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _layout_label(self, layout: LayoutDefinition) -> str:
         ship_count = len(layout.ships)
-        return f"{layout.name} ({layout.board_size}x{layout.board_size}, {ship_count} ships)"
+        tag = "Custom" if is_custom_layout_id(layout.layout_id) else "Built-in"
+        return f"{layout.name} ({layout.board_size}x{layout.board_size}, {ship_count} ships) [{tag}]"
 
     def _layout_index(self, layout: LayoutDefinition) -> int:
         for i, candidate in enumerate(self.layouts):
@@ -107,6 +111,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 and candidate.layout_version == layout.layout_version
                 and candidate.layout_hash == layout.layout_hash
             ):
+                return i
+        for i, candidate in enumerate(self.layouts):
+            if candidate.layout_id == layout.layout_id:
                 return i
         return -1
 
@@ -133,11 +140,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.attack_tab = AttackTab(self.stats, self.layout_runtime)
         self.defense_tab = DefenseTab(self.layout_runtime)
         self.model_tab = ModelStatsTab(self.layout_runtime)
+        self.layouts_tab = LayoutsTab(
+            get_active_layout=lambda: self.layout_definition,
+            on_layouts_updated=self.refresh_layouts,
+            on_layout_selected=self._set_layout,
+        )
         self.attack_tab.linked_defense_tab = self.defense_tab
 
         self.tabs.addTab(self.attack_tab, "You attack")
         self.tabs.addTab(self.defense_tab, "Opponent attacks you")
         self.tabs.addTab(self.model_tab, "Model stats")
+        self.tabs.addTab(self.layouts_tab, "Layouts")
 
     def _save_tabs_state(self):
         try:
@@ -181,6 +194,28 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = self.layout_combo.itemData(index)
         if isinstance(layout, LayoutDefinition):
             self._set_layout(layout, persist=True)
+
+    def refresh_layouts(self):
+        current_layout = self.layout_definition
+        self.custom_layouts = load_custom_layouts()
+        self.layouts = list(builtin_layouts()) + list(self.custom_layouts)
+        self.layout_combo.blockSignals(True)
+        self.layout_combo.clear()
+        for layout in self.layouts:
+            self.layout_combo.addItem(self._layout_label(layout), userData=layout)
+        idx = self._layout_index(current_layout)
+        if idx < 0 and self.layouts:
+            idx = 0
+        if idx >= 0:
+            current_layout = self.layouts[idx]
+            self.layout_combo.setCurrentIndex(idx)
+        self.layout_combo.blockSignals(False)
+        if (
+            current_layout.layout_id != self.layout_definition.layout_id
+            or current_layout.layout_version != self.layout_definition.layout_version
+            or current_layout.layout_hash != self.layout_definition.layout_hash
+        ):
+            self._set_layout(current_layout, persist=True)
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self._save_tabs_state()

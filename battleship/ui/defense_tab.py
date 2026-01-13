@@ -762,6 +762,8 @@ class DefenseTab(QtWidgets.QWidget):
                 btn = self.cell_buttons_def[r][c]
                 has_ship = (self.layout_board[r][c] == HAS_SHIP)
                 shot_state = self.shot_board[r][c]
+                if self._is_place_mode():
+                    shot_state = NO_SHOT
 
                 hcount, mcount = self._total_counts_cell(r, c)
                 total_count = hcount + mcount
