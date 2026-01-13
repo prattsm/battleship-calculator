@@ -41,6 +41,9 @@ class ShipDialog(QtWidgets.QDialog):
     def __init__(self, ship: Optional[ShipSpec] = None, parent=None):
         super().__init__(parent)
         self.ship = ship
+        self._grid_updating = False
+        self.grid_size = 6
+        self.grid_buttons: List[List[QtWidgets.QToolButton]] = []
         self.setWindowTitle("Ship Editor")
         self.resize(420, 360)
         self._build_ui()
@@ -70,6 +73,33 @@ class ShipDialog(QtWidgets.QDialog):
         self.cells_edit.setPlaceholderText("Example:\n0,0\n0,1\n1,0")
         form.addRow("Shape cells", self.cells_edit)
 
+        self.shape_group = QtWidgets.QGroupBox("Shape painter")
+        shape_layout = QtWidgets.QVBoxLayout(self.shape_group)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Grid size"))
+        self.grid_spin = QtWidgets.QSpinBox()
+        self.grid_spin.setRange(2, 12)
+        self.grid_spin.setValue(self.grid_size)
+        self.grid_spin.valueChanged.connect(self._resize_grid)
+        row.addWidget(self.grid_spin)
+        self.clear_grid_btn = QtWidgets.QPushButton("Clear grid")
+        self.clear_grid_btn.clicked.connect(self._clear_grid)
+        row.addWidget(self.clear_grid_btn)
+        self.sync_text_btn = QtWidgets.QPushButton("Load from text")
+        self.sync_text_btn.clicked.connect(self._sync_grid_from_text)
+        row.addWidget(self.sync_text_btn)
+        row.addStretch(1)
+        shape_layout.addLayout(row)
+
+        self.grid_widget = QtWidgets.QWidget()
+        self.grid_layout = QtWidgets.QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(2)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        shape_layout.addWidget(self.grid_widget)
+
+        layout.addWidget(self.shape_group)
+
         self.rotate_cb = QtWidgets.QCheckBox("Allow rotations")
         self.rotate_cb.setChecked(True)
         form.addRow("", self.rotate_cb)
@@ -87,11 +117,13 @@ class ShipDialog(QtWidgets.QDialog):
         layout.addWidget(btns)
 
         self._on_kind_changed()
+        self._build_shape_grid(self.grid_size)
 
     def _on_kind_changed(self):
         is_line = self.kind_combo.currentText() == "line"
         self.length_spin.setEnabled(is_line)
         self.cells_edit.setEnabled(not is_line)
+        self.shape_group.setEnabled(not is_line)
 
     def _load_ship(self, ship: ShipSpec):
         self.id_input.setText(ship.instance_id)
@@ -103,6 +135,91 @@ class ShipDialog(QtWidgets.QDialog):
             self.cells_edit.setPlainText(cells)
         self.rotate_cb.setChecked(bool(ship.allow_rotations))
         self._on_kind_changed()
+        if ship.kind == "shape":
+            self._sync_grid_from_text()
+
+    def _build_shape_grid(self, size: int):
+        for i in reversed(range(self.grid_layout.count())):
+            item = self.grid_layout.itemAt(i)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.grid_buttons = []
+        for r in range(size):
+            row: List[QtWidgets.QToolButton] = []
+            for c in range(size):
+                btn = QtWidgets.QToolButton()
+                btn.setCheckable(True)
+                btn.setFixedSize(22, 22)
+                btn.clicked.connect(lambda checked, rr=r, cc=c: self._toggle_grid_cell(rr, cc))
+                row.append(btn)
+                self.grid_layout.addWidget(btn, r, c)
+            self.grid_buttons.append(row)
+
+    def _resize_grid(self):
+        size = int(self.grid_spin.value())
+        if size == self.grid_size:
+            return
+        current = self._grid_cells()
+        self.grid_size = size
+        self._build_shape_grid(size)
+        for r, c in current:
+            if r < size and c < size:
+                self.grid_buttons[r][c].setChecked(True)
+        self._sync_text_from_grid()
+
+    def _grid_cells(self) -> Tuple[Tuple[int, int], ...]:
+        cells = []
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.grid_buttons and self.grid_buttons[r][c].isChecked():
+                    cells.append((r, c))
+        return normalize_shape_cells(cells)
+
+    def _sync_text_from_grid(self):
+        self._grid_updating = True
+        cells = self._grid_cells()
+        text = "\n".join(f"{r},{c}" for r, c in cells)
+        self.cells_edit.blockSignals(True)
+        self.cells_edit.setPlainText(text)
+        self.cells_edit.blockSignals(False)
+        self._grid_updating = False
+
+    def _sync_grid_from_text(self):
+        if self._grid_updating:
+            return
+        try:
+            cells = _parse_cells(self.cells_edit.toPlainText())
+        except Exception as exc:
+            self.error_label.setText(str(exc))
+            return
+        max_r = max((r for r, _ in cells), default=0)
+        max_c = max((c for _, c in cells), default=0)
+        size = max(max_r, max_c, self.grid_size - 1) + 1
+        if size != self.grid_size:
+            self.grid_size = min(max(size, 2), 12)
+            self.grid_spin.blockSignals(True)
+            self.grid_spin.setValue(self.grid_size)
+            self.grid_spin.blockSignals(False)
+            self._build_shape_grid(self.grid_size)
+        self._clear_grid(update_text=False)
+        for r, c in cells:
+            if r < self.grid_size and c < self.grid_size:
+                self.grid_buttons[r][c].setChecked(True)
+        self._sync_text_from_grid()
+
+    def _toggle_grid_cell(self, r: int, c: int):
+        if self._grid_updating:
+            return
+        self._sync_text_from_grid()
+
+    def _clear_grid(self, update_text: bool = True):
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.grid_buttons:
+                    self.grid_buttons[r][c].setChecked(False)
+        if update_text:
+            self._sync_text_from_grid()
 
     def _validate(self) -> Optional[ShipSpec]:
         instance_id = self.id_input.text().strip()
@@ -129,6 +246,8 @@ class ShipDialog(QtWidgets.QDialog):
         except Exception as exc:
             self.error_label.setText(str(exc))
             return None
+        if not cells:
+            cells = self._grid_cells()
         if not cells:
             self.error_label.setText("Shape ships must define at least one cell.")
             return None
