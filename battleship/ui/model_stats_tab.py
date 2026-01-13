@@ -9,7 +9,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from battleship.domain.config import PARAM_SPECS
 from battleship.layouts.cache import LayoutRuntime
-from battleship.persistence.layout_state import load_layout_state, save_layout_state
+from battleship.persistence.layout_state import find_layout_versions, load_layout_state, save_layout_state
 from battleship.sim.attack_sim import simulate_model_game, simulate_model_game_with_phases
 from battleship.strategies.registry import model_defs
 from battleship.domain.phase import PHASE_ENDGAME, PHASE_HUNT, PHASE_TARGET
@@ -170,6 +170,11 @@ class ModelStatsTab(QtWidgets.QWidget):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
+        self.stale_label = QtWidgets.QLabel("")
+        self.stale_label.setStyleSheet("color: #ffb84d; font-weight: bold;")
+        self.stale_label.setWordWrap(True)
+        layout.addWidget(self.stale_label)
+
     # ---------------- State helpers ----------------
 
     def _phase_template(self) -> Dict[str, Dict[str, object]]:
@@ -250,6 +255,14 @@ class ModelStatsTab(QtWidgets.QWidget):
             path = self.STATE_PATH
         data, _raw = load_layout_state(path, self.layout)
         if not data:
+            stale = find_layout_versions(path, self.layout.layout_id)
+            if stale:
+                versions = ", ".join(sorted({f"v{v}" for v, _ in stale}))
+                self.stale_label.setText(
+                    f"Stats exist for previous layout versions ({versions}) and are now stale. Run new sims."
+                )
+            else:
+                self.stale_label.setText("")
             return
 
         stats = data.get("model_stats")
@@ -267,6 +280,7 @@ class ModelStatsTab(QtWidgets.QWidget):
                 k: v for k, v in best_by_phase.items() if isinstance(k, str) and isinstance(v, str)
             }
         self._ensure_all_models()
+        self.stale_label.setText("")
 
     # ---------------- Stats merge + table ----------------
 

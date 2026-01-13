@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from battleship.layouts.builtins import legacy_layout
 from battleship.layouts.definition import LayoutDefinition
@@ -60,3 +60,26 @@ def delete_layout_state(path: str, layout: LayoutDefinition) -> None:
             json.dump(data, f)
     except OSError:
         pass
+
+
+def find_layout_versions(path: str, layout_id: str) -> List[Tuple[int, str]]:
+    data = _load_raw(path)
+    layouts = data.get("layouts", {})
+    results: List[Tuple[int, str]] = []
+    if not isinstance(layouts, dict):
+        return results
+    for key in layouts.keys():
+        if not isinstance(key, str):
+            continue
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            continue
+        lid, version_str, layout_hash = parts
+        if lid != layout_id:
+            continue
+        try:
+            version = int(version_str)
+        except ValueError:
+            continue
+        results.append((version, layout_hash))
+    return results

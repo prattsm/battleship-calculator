@@ -256,6 +256,13 @@ class AttackTab(QtWidgets.QWidget):
         explain_layout.addWidget(self.explain_summary_label)
         right_layout.addWidget(explain_group)
 
+        whatif_group = QtWidgets.QGroupBox("What-if preview")
+        whatif_layout = QtWidgets.QVBoxLayout(whatif_group)
+        self.whatif_label = QtWidgets.QLabel("No preview yet.")
+        self.whatif_label.setWordWrap(True)
+        whatif_layout.addWidget(self.whatif_label)
+        right_layout.addWidget(whatif_group)
+
         self.recompute_button = QtWidgets.QPushButton("Recompute now")
         self.recompute_button.clicked.connect(self.recompute)
         right_layout.addWidget(self.recompute_button)
@@ -939,6 +946,40 @@ class AttackTab(QtWidgets.QWidget):
         else:
             self.explain_summary_label.setText("")
 
+    def _update_whatif_preview(self):
+        if self.game_over or self.num_world_samples <= 0:
+            self.whatif_label.setText("No preview available.")
+            return
+
+        target_cell = None
+        if self.active_cell is not None:
+            r, c = self.active_cell
+            if self.board[r][c] == EMPTY:
+                target_cell = (r, c)
+        if target_cell is None and self.best_cells:
+            target_cell = self.best_cells[0]
+
+        if target_cell is None:
+            self.whatif_label.setText("No preview available.")
+            return
+
+        r, c = target_cell
+        idx = cell_index(r, c, self.board_size)
+        n_hit = self.cell_hit_counts[idx]
+        n_miss = self.num_world_samples - n_hit
+        p_hit = (n_hit / self.num_world_samples) if self.num_world_samples > 0 else 0.0
+        expected_worlds = 0.0
+        if self.num_world_samples > 0:
+            expected_worlds = (n_hit * n_hit + n_miss * n_miss) / self.num_world_samples
+        info_gain = self.num_world_samples - expected_worlds
+        source = "active cell" if target_cell == self.active_cell else "best suggestion"
+        cell_label = f"{r + 1}{chr(ord('A') + c)}"
+        self.whatif_label.setText(
+            f"Using {source} {cell_label}:\n"
+            f"p(hit)={p_hit:.3f}, worlds if hit={n_hit}, if miss={n_miss}\n"
+            f"Expected info gain (1-ply): {info_gain:.1f}"
+        )
+
     def _compute_warnings(self) -> str:
         warnings = []
         total_hits = sum(row.count(HIT) for row in self.board)
@@ -1384,6 +1425,7 @@ class AttackTab(QtWidgets.QWidget):
         )
 
         self._update_explanation_panel(candidates, score_label, higher_better, note)
+        self._update_whatif_preview()
 
         self.update_board_view()
         self.update_status_view()

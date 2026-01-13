@@ -668,6 +668,7 @@ class LayoutsTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Layout errors", "\n".join(errors))
             return
 
+        version_bumped = False
         if old_layout is not None and old_layout.layout_hash != candidate.layout_hash:
             candidate = LayoutDefinition(
                 layout_id=layout_id,
@@ -677,6 +678,7 @@ class LayoutsTab(QtWidgets.QWidget):
                 allow_touching=allow_touching,
                 layout_version=layout_version + 1,
             )
+            version_bumped = True
 
         updated = False
         new_layouts: List[LayoutDefinition] = []
@@ -693,7 +695,12 @@ class LayoutsTab(QtWidgets.QWidget):
         self.current_layout_id = candidate.layout_id
         self.custom_layouts = new_layouts
         self._refresh_layout_list(select_id=candidate.layout_id)
-        self.status_label.setText(f"Saved layout {candidate.name} (v{candidate.layout_version}).")
+        if version_bumped:
+            self.status_label.setText(
+                f"Saved layout {candidate.name} (v{candidate.layout_version}). Previous stats are now stale."
+            )
+        else:
+            self.status_label.setText(f"Saved layout {candidate.name} (v{candidate.layout_version}).")
         if self.on_layouts_updated:
             self.on_layouts_updated()
 
