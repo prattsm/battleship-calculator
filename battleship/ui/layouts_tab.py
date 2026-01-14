@@ -567,8 +567,14 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_specs = list(layout.ships)
         self._refresh_ship_table()
         self._update_layout_summary()
-        self.status_label.setText(f"Viewing {layout.name} (v{layout.layout_version}).")
-        self._set_edit_enabled(False)
+        if is_custom_layout_id(layout.layout_id):
+            self.status_label.setText(f"Editing {layout.name} (v{layout.layout_version}).")
+            self._set_edit_enabled(True)
+        else:
+            self.status_label.setText(
+                f"Viewing {layout.name} (v{layout.layout_version}). Built-in layouts are read-only."
+            )
+            self._set_edit_enabled(False)
 
     def _add_ship(self):
         dialog = ShipDialog(parent=self, force_shape=True)
