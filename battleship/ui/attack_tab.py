@@ -37,6 +37,10 @@ from battleship.ui.theme import Theme
 
 
 class AttackTab(QtWidgets.QWidget):
+    shot_recorded = QtCore.pyqtSignal()
+    state_updated = QtCore.pyqtSignal()
+    game_result = QtCore.pyqtSignal(bool)
+    opponent_changed = QtCore.pyqtSignal(str)
     STATE_PATH = "battleship_attack_state.json"
     MODEL_STATS_PATH = "battleship_model_stats.json"
     AUTO_MODE_PHASE = "auto_phase"
@@ -662,16 +666,17 @@ class AttackTab(QtWidgets.QWidget):
             self._import_opponent_profile(profile)
         self.save_state()
         self.recompute()
+        try:
+            self.opponent_changed.emit(self._current_opponent_name())
+        except Exception:
+            pass
 
     def _add_opponent(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "Add Opponent", "Opponent name:")
         if not ok:
             return
         name = str(name).strip() or "Opponent"
-        oid = f"opp_{uuid.uuid4().hex[:8]}"
-        self.opponents[oid] = self._new_opponent_profile(name)
-        self._save_current_profile()
-        self.active_opponent_id = oid
+        oid = self._ensure_opponent_by_name(name)
         self._refresh_opponent_combo(oid)
         self._import_opponent_profile(self.opponents[oid])
         self.save_state()
@@ -713,6 +718,38 @@ class AttackTab(QtWidgets.QWidget):
         self._import_opponent_profile(self.opponents[self.active_opponent_id])
         self.save_state()
         self.recompute()
+
+    def _ensure_opponent_by_name(self, name: str) -> str:
+        clean = str(name or "").strip() or "Opponent"
+        for oid, profile in self.opponents.items():
+            if not isinstance(profile, dict):
+                continue
+            pname = str(profile.get("name") or "").strip()
+            if pname.lower() == clean.lower():
+                return oid
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        self.opponents[oid] = self._new_opponent_profile(clean)
+        self._save_current_profile()
+        self.active_opponent_id = oid
+        return oid
+
+    def set_active_opponent_by_name(self, name: str) -> None:
+        oid = self._ensure_opponent_by_name(name)
+        self.active_opponent_id = oid
+        self._refresh_opponent_combo(oid)
+        self._import_opponent_profile(self.opponents[oid])
+        self.save_state()
+        self.recompute()
+
+    def get_opponent_names(self) -> List[str]:
+        names: List[str] = []
+        for profile in self.opponents.values():
+            if not isinstance(profile, dict):
+                continue
+            pname = str(profile.get("name") or "").strip()
+            if pname:
+                names.append(pname)
+        return names
 
     def _update_opponent_stats_label(self) -> None:
         if not hasattr(self, "opponent_stats_label"):
@@ -1066,6 +1103,11 @@ class AttackTab(QtWidgets.QWidget):
             return
         self._push_history()
         self.board[r][c] = new_state
+        if current == EMPTY and new_state in (HIT, MISS):
+            try:
+                self.shot_recorded.emit()
+            except Exception:
+                pass
         if new_state == HIT and self.assign_mode_ship is not None:
             self._toggle_assignment(self.assign_mode_ship, r, c)
         elif new_state != HIT:
@@ -1765,6 +1807,10 @@ class AttackTab(QtWidgets.QWidget):
     def _record_game_result(self, win: bool):
         self.stats.record_game(win)
         self.stats_label.setText(self.stats.summary_text())
+        try:
+            self.game_result.emit(bool(win))
+        except Exception:
+            pass
         # Start a completely fresh board for the next game
         self.clear_board()
 
@@ -1859,27 +1905,31 @@ class AttackTab(QtWidgets.QWidget):
     # In AttackTab class, add the prediction logic:
     def update_win_prediction(self, defense_tab):
         """Simulate Me vs Opponent."""
-        if not self.world_masks or not defense_tab.layout_board:
+        result = self.compute_win_prediction(defense_tab)
+        if result is None:
             self.win_prob_label.setText("Win Prob: N/A (Need Defense Layout)")
             return
+        prob, my_total, opp_avg = result
+        self.win_prob_label.setText(
+            f"Win Probability: {prob:.1f}% (Me: ~{my_total:.1f} vs Opp: ~{opp_avg:.1f})"
+        )
+
+    def compute_win_prediction(self, defense_tab) -> Optional[Tuple[float, float, float]]:
+        """Return (win_pct, my_total, opp_avg) or None if unavailable."""
+        if not self.world_masks or not getattr(defense_tab, "layout_board", None):
+            return None
 
         # 1. Estimate MY remaining shots
         my_rem_samples = []
         rng = random.Random()
-        # Sample up to 10 worlds
         sample_worlds = rng.sample(self.world_masks, min(10, len(self.world_masks)))
 
         for w_mask in sample_worlds:
-            # Quick sim of greedy solver vs this world
-            # Copy board
             sim_board = [row[:] for row in self.board]
             shots = 0
             rem_targets = bin(w_mask).count("1") - sum(row.count(HIT) for row in self.board)
 
             while rem_targets > 0 and shots < self.board_size * self.board_size:
-                # Simple greedy selection on sim_board
-                # (You can copy the logic from _choose_next_shot_for_strategy here
-                # or make a fast helper. For speed, just pick random unknown cell)
                 unknown = [
                     (r, c)
                     for r in range(self.board_size)
@@ -1888,18 +1938,19 @@ class AttackTab(QtWidgets.QWidget):
                 ]
                 if not unknown:
                     break
-                r, c = rng.choice(unknown)  # Fast approximation
+                r, c = rng.choice(unknown)
                 sim_board[r][c] = HIT if (w_mask & (1 << cell_index(r, c, self.board_size))) else MISS
                 if sim_board[r][c] == HIT:
                     rem_targets -= 1
                 shots += 1
             my_rem_samples.append(shots)
 
+        if not my_rem_samples:
+            return None
         my_avg_rem = sum(my_rem_samples) / len(my_rem_samples)
         my_total = (sum(row.count(HIT) + row.count(MISS) for row in self.board)) + my_avg_rem
 
         # 2. Estimate OPPONENT remaining shots
-        # Create mask from defense tab layout
         layout_mask = 0
         for r in range(self.board_size):
             for c in range(self.board_size):
@@ -1916,7 +1967,6 @@ class AttackTab(QtWidgets.QWidget):
 
         opp_rem_samples = []
         for _ in range(10):
-            # Run simulation starting from current defense board state
             s_taken, _ = simulate_enemy_game_phase(
                 layout_mask,
                 base_heat,
@@ -1926,24 +1976,23 @@ class AttackTab(QtWidgets.QWidget):
                 board_size=self.board_size,
                 initial_shot_board=defense_tab.shot_board,
             )
-            # simulate_enemy returns TOTAL shots, so we don't need to add current
             opp_rem_samples.append(s_taken)
 
+        if not opp_rem_samples:
+            return None
         opp_avg = sum(opp_rem_samples) / len(opp_rem_samples)
 
-        # 3. Calculate Win % (Simple comparison of distributions)
         wins = 0
         total_comps = 0
         for m in my_rem_samples:
-            # adjusting my total vs opp total
             m_tot = (sum(row.count(HIT) + row.count(MISS) for row in self.board)) + m
             for o in opp_rem_samples:
                 if m_tot < o:
-                    wins += 1  # I finish faster
+                    wins += 1
                 total_comps += 1
 
         prob = (wins / total_comps) * 100 if total_comps else 0
-        self.win_prob_label.setText(f"Win Probability: {prob:.1f}% (Me: ~{my_total:.1f} vs Opp: ~{opp_avg:.1f})")
+        return prob, float(my_total), float(opp_avg)
 
     def recompute(self, defense_tab=None):
         # Rebuild world samples and ship-sunk probabilities
@@ -2119,6 +2168,10 @@ class AttackTab(QtWidgets.QWidget):
 
         if self.linked_defense_tab:
             self.update_win_prediction(self.linked_defense_tab)
+        try:
+            self.state_updated.emit()
+        except Exception:
+            pass
 
     def _choose_best_cells_with_2ply(self) -> Tuple[List[float], List[Tuple[int, int]], float]:
         if not self.world_masks:

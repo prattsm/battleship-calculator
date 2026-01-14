@@ -18,6 +18,9 @@ from battleship.ui.theme import Theme
 
 
 class DefenseTab(QtWidgets.QWidget):
+    shot_recorded = QtCore.pyqtSignal()
+    state_updated = QtCore.pyqtSignal()
+    opponent_changed = QtCore.pyqtSignal(str)
     STATE_PATH = "battleship_defense_state.json"
 
     def __init__(self, layout_runtime: LayoutRuntime, parent=None):
@@ -514,16 +517,17 @@ class DefenseTab(QtWidgets.QWidget):
         if isinstance(profile, dict):
             self._import_profile(profile)
         self.save_state()
+        try:
+            self.opponent_changed.emit(self._current_opponent_name())
+        except Exception:
+            pass
 
     def _add_opponent(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "Add Opponent", "Opponent name:")
         if not ok:
             return
         name = str(name).strip() or "Opponent"
-        oid = f"opp_{uuid.uuid4().hex[:8]}"
-        self.opponents[oid] = self._new_opponent_profile(name)
-        self._save_current_profile()
-        self.active_opponent_id = oid
+        oid = self._ensure_opponent_by_name(name)
         self._refresh_opponent_combo(oid)
         self._import_profile(self.opponents[oid])
         self.save_state()
@@ -563,6 +567,37 @@ class DefenseTab(QtWidgets.QWidget):
         self._refresh_opponent_combo(self.active_opponent_id)
         self._import_profile(self.opponents[self.active_opponent_id])
         self.save_state()
+
+    def _ensure_opponent_by_name(self, name: str) -> str:
+        clean = str(name or "").strip() or "Opponent"
+        for oid, profile in self.opponents.items():
+            if not isinstance(profile, dict):
+                continue
+            pname = str(profile.get("name") or "").strip()
+            if pname.lower() == clean.lower():
+                return oid
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        self.opponents[oid] = self._new_opponent_profile(clean)
+        self._save_current_profile()
+        self.active_opponent_id = oid
+        return oid
+
+    def set_active_opponent_by_name(self, name: str) -> None:
+        oid = self._ensure_opponent_by_name(name)
+        self.active_opponent_id = oid
+        self._refresh_opponent_combo(oid)
+        self._import_profile(self.opponents[oid])
+        self.save_state()
+
+    def get_opponent_names(self) -> List[str]:
+        names: List[str] = []
+        for profile in self.opponents.values():
+            if not isinstance(profile, dict):
+                continue
+            pname = str(profile.get("name") or "").strip()
+            if pname:
+                names.append(pname)
+        return names
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "board_container", None) and event.type() == QtCore.QEvent.Resize:
@@ -673,6 +708,10 @@ class DefenseTab(QtWidgets.QWidget):
         self.layout_board[r][c] = HAS_SHIP if self.layout_board[r][c] == NO_SHIP else NO_SHIP
         self.update_board_view()
         self.update_summary_labels()
+        try:
+            self.state_updated.emit()
+        except Exception:
+            pass
 
     def clear_layout(self):
         for r in range(self.board_size):
@@ -779,6 +818,10 @@ class DefenseTab(QtWidgets.QWidget):
                     type_idx = 1 if last_hit else 0
                     self.disp_counts[phase_idx][type_idx][dr + DISP_RADIUS][dc + DISP_RADIUS] += 1
             self.last_shot_for_sequence = (r, c, phase, was_hit)
+            try:
+                self.shot_recorded.emit()
+            except Exception:
+                pass
         else:
             # undo
             for i in range(len(self.history_events) - 1, -1, -1):
@@ -803,6 +846,10 @@ class DefenseTab(QtWidgets.QWidget):
                     self.last_shot_for_sequence = None
         self.update_board_view()
         self.update_summary_labels()
+        try:
+            self.state_updated.emit()
+        except Exception:
+            pass
 
     def clear_shots(self):
         # Treat this as "end of game": decay historical stats so that
@@ -817,6 +864,10 @@ class DefenseTab(QtWidgets.QWidget):
         self.last_shot_for_sequence = None
         self.update_board_view()
         self.update_summary_labels()
+        try:
+            self.state_updated.emit()
+        except Exception:
+            pass
 
     def reset_model(self):
         for p in range(4):
@@ -846,6 +897,10 @@ class DefenseTab(QtWidgets.QWidget):
             "Learning reset.\nRecord opponent shots, then click 'Suggest layout'."
         )
         self.save_state()
+        try:
+            self.state_updated.emit()
+        except Exception:
+            pass
 
     def compute_suggested_layout(self):
         base_heat_phase, _pattern = self._build_base_heat_phase()
