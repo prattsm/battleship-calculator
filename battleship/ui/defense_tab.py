@@ -1340,9 +1340,9 @@ class DefenseEvalWorker(QtCore.QThread):
         hit_counts_phase,
         miss_counts_phase,
         disp_counts,
-        base_heat_phase=None,
         games_per_layout: int,
         random_layouts: int,
+        base_heat_phase=None,
     ):
         super().__init__()
         self.current_mask = int(current_mask)
