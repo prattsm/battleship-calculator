@@ -160,6 +160,7 @@ class ShipDialog(QtWidgets.QDialog):
             self._sync_grid_from_text()
 
     def _build_shape_grid(self, size: int):
+        pos = self.pos()
         for i in reversed(range(self.grid_layout.count())):
             item = self.grid_layout.itemAt(i)
             widget = item.widget()
@@ -181,8 +182,10 @@ class ShipDialog(QtWidgets.QDialog):
                 row.append(btn)
                 self.grid_layout.addWidget(btn, r, c)
             self.grid_buttons.append(row)
+        self.move(pos)
 
     def _resize_grid(self):
+        pos = self.pos()
         size = int(self.grid_spin.value())
         if size == self.grid_size:
             return
@@ -193,6 +196,7 @@ class ShipDialog(QtWidgets.QDialog):
             if r < size and c < size:
                 self.grid_buttons[r][c].setChecked(True)
         self._sync_text_from_grid()
+        self.move(pos)
 
     def _grid_cells(self) -> Tuple[Tuple[int, int], ...]:
         cells = []
@@ -223,11 +227,13 @@ class ShipDialog(QtWidgets.QDialog):
         max_c = max((c for _, c in cells), default=0)
         size = max(max_r, max_c, self.grid_size - 1) + 1
         if size != self.grid_size:
+            pos = self.pos()
             self.grid_size = min(max(size, 2), 12)
             self.grid_spin.blockSignals(True)
             self.grid_spin.setValue(self.grid_size)
             self.grid_spin.blockSignals(False)
             self._build_shape_grid(self.grid_size)
+            self.move(pos)
         self._clear_grid(update_text=False)
         for r, c in cells:
             if r < self.grid_size and c < self.grid_size:
@@ -380,6 +386,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_table.verticalHeader().setVisible(False)
         self.ship_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.ship_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.ship_table.cellDoubleClicked.connect(lambda _r, _c: self._edit_ship())
         ship_layout.addWidget(self.ship_table)
 
         ship_btns = QtWidgets.QHBoxLayout()
@@ -481,7 +488,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_specs = []
         self._refresh_ship_table()
         self._update_layout_summary()
-        self.status_label.setText("Click New to start a layout, then name it to unlock editing.")
+        self.status_label.setText("Create a new layout to begin editing.")
         self._set_edit_enabled(False)
 
     def _set_edit_enabled(self, enabled: bool):
@@ -506,6 +513,7 @@ class LayoutsTab(QtWidgets.QWidget):
             self._update_current_list_label(name_override=name)
 
     def _refresh_ship_table(self):
+        selected_row = self.ship_table.currentRow() if hasattr(self, "ship_table") else -1
         self.ship_table.setRowCount(len(self.ship_specs))
         for row, spec in enumerate(self.ship_specs):
             size = ""
@@ -523,6 +531,10 @@ class LayoutsTab(QtWidgets.QWidget):
             for col, val in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(val)
                 self.ship_table.setItem(row, col, it)
+        if self.ship_specs:
+            if selected_row < 0 or selected_row >= len(self.ship_specs):
+                selected_row = len(self.ship_specs) - 1
+            self.ship_table.setCurrentCell(selected_row, 0)
         self._update_layout_summary()
 
     def _update_layout_summary(self):
@@ -555,7 +567,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_specs = list(layout.ships)
         self._refresh_ship_table()
         self._update_layout_summary()
-        self.status_label.setText(f"Viewing {layout.name} (v{layout.layout_version}). Click New to edit.")
+        self.status_label.setText(f"Viewing {layout.name} (v{layout.layout_version}).")
         self._set_edit_enabled(False)
 
     def _add_ship(self):
@@ -578,6 +590,9 @@ class LayoutsTab(QtWidgets.QWidget):
         if row < 0 or row >= len(self.ship_specs):
             return
         self.ship_specs.pop(row)
+        if self.ship_table.rowCount() > 1:
+            next_row = min(row, len(self.ship_specs) - 1)
+            self.ship_table.setCurrentCell(next_row, 0)
         self._refresh_ship_table()
 
     def new_layout(self):
@@ -767,6 +782,7 @@ class LayoutsTab(QtWidgets.QWidget):
             )
         else:
             self.status_label.setText(f"Saved layout {candidate.name} (v{candidate.layout_version}).")
+        self._set_edit_enabled(True)
         if self.on_layouts_updated:
             self.on_layouts_updated()
 

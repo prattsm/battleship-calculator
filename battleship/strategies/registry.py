@@ -98,13 +98,13 @@ def model_defs() -> List[Dict[str, object]]:
             "key": "ucb_explore",
             "name": "UCB Explore",
             "description": "Adds an uncertainty bonus to probability scoring to encourage exploration.",
-            "notes": "Data-free exploration that prefers cells with high posterior uncertainty. Tunable via the UCB bonus parameter.",
+            "notes": "Exploration-leaning variant of Greedy. Helps early when probabilities are flat; can over-explore if c is large.",
         },
         {
             "key": "rollout_mcts",
             "name": "Rollout Lookahead",
             "description": "Chooses shots by simulating outcomes for top candidates and minimizing expected remaining shots.",
-            "notes": "Monte Carlo lookahead with a fast rollout policy. Data-free but heavier to simulate; keep rollouts small in Model Stats.",
+            "notes": "Monte Carlo lookahead with a fast rollout policy. Slower but can reduce total shots when the posterior is ambiguous.",
         },
         {
             "key": "two_ply",
