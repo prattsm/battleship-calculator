@@ -202,10 +202,6 @@ class MainWindow(QtWidgets.QMainWindow):
         match_layout.addWidget(self.match_delete_btn, 0, 5)
         match_layout.addWidget(self.match_record_label, 0, 6)
 
-        match_layout.addWidget(self.match_win_label, 1, 0, 1, 2)
-        match_layout.addWidget(self.match_shots_label, 1, 2, 1, 2)
-        match_layout.addWidget(self.match_turn_label, 1, 4, 1, 2)
-
         btn_layout = QtWidgets.QHBoxLayout()
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(8)
@@ -213,7 +209,11 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(self.match_record_win_btn)
         btn_layout.addWidget(self.match_record_loss_btn)
         btn_layout.addStretch(1)
-        match_layout.addLayout(btn_layout, 0, 7, 2, 1)
+        match_layout.addLayout(btn_layout, 1, 0, 1, 8)
+
+        match_layout.addWidget(self.match_win_label, 2, 0, 1, 2)
+        match_layout.addWidget(self.match_shots_label, 2, 2, 1, 2)
+        match_layout.addWidget(self.match_turn_label, 2, 4, 1, 2)
 
         root_layout.addWidget(self.match_group)
 
