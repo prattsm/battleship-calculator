@@ -98,13 +98,13 @@ def model_defs() -> List[Dict[str, object]]:
             "key": "ucb_explore",
             "name": "UCB Explore",
             "description": "Adds an uncertainty bonus to probability scoring to encourage exploration.",
-            "notes": "Exploration-leaning variant of Greedy. Helps early when probabilities are flat; can over-explore if c is large.",
+            "notes": "A controlled-exploration variant of Greedy. Helps early when the posterior is flat; too much bonus can be wasteful.",
         },
         {
             "key": "rollout_mcts",
             "name": "Rollout Lookahead",
             "description": "Chooses shots by simulating outcomes for top candidates and minimizing expected remaining shots.",
-            "notes": "Monte Carlo lookahead with a fast rollout policy. Slower but can reduce total shots when the posterior is ambiguous.",
+            "notes": "Monte Carlo lookahead with a fast rollout policy. Slower, but can save shots when the next move is ambiguous.",
         },
         {
             "key": "two_ply",
