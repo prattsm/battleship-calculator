@@ -97,6 +97,9 @@ class ShipDialog(QtWidgets.QDialog):
         self.grid_layout.setSpacing(2)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
         shape_layout.addWidget(self.grid_widget)
+        legend = QtWidgets.QLabel("Selected cells are highlighted.")
+        legend.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
+        shape_layout.addWidget(legend)
 
         layout.addWidget(self.shape_group)
 
@@ -145,12 +148,17 @@ class ShipDialog(QtWidgets.QDialog):
             if widget is not None:
                 widget.setParent(None)
         self.grid_buttons = []
+        style = (
+            f"QToolButton {{ background-color: {Theme.BG_PANEL}; border: 1px solid {Theme.BG_BUTTON}; }}"
+            f"QToolButton:checked {{ background-color: {Theme.HIGHLIGHT}; border: 2px solid #7dd3fc; }}"
+        )
         for r in range(size):
             row: List[QtWidgets.QToolButton] = []
             for c in range(size):
                 btn = QtWidgets.QToolButton()
                 btn.setCheckable(True)
                 btn.setFixedSize(22, 22)
+                btn.setStyleSheet(style)
                 btn.clicked.connect(lambda checked, rr=r, cc=c: self._toggle_grid_cell(rr, cc))
                 row.append(btn)
                 self.grid_layout.addWidget(btn, r, c)
@@ -283,6 +291,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.custom_layouts: List[LayoutDefinition] = load_custom_layouts(CUSTOM_LAYOUTS_PATH)
         self.current_layout_id: Optional[str] = None
         self.ship_specs: List[ShipSpec] = []
+        self._edit_mode = False
 
         self._build_ui()
         self._refresh_layout_list(select_first=True)
@@ -332,6 +341,7 @@ class LayoutsTab(QtWidgets.QWidget):
 
         form = QtWidgets.QFormLayout()
         self.name_input = QtWidgets.QLineEdit()
+        self.name_input.textChanged.connect(self._on_name_changed)
         form.addRow("Name", self.name_input)
         self.board_spin = QtWidgets.QSpinBox()
         self.board_spin.setRange(4, 20)
@@ -357,9 +367,11 @@ class LayoutsTab(QtWidgets.QWidget):
         ship_btns = QtWidgets.QHBoxLayout()
         self.add_line_btn = QtWidgets.QPushButton("Add line")
         self.add_line_btn.clicked.connect(lambda: self._add_ship("line"))
+        self.add_line_btn.setToolTip("Add a straight ship (horizontal/vertical) of a chosen length.")
         ship_btns.addWidget(self.add_line_btn)
         self.add_shape_btn = QtWidgets.QPushButton("Add shape")
         self.add_shape_btn.clicked.connect(lambda: self._add_ship("shape"))
+        self.add_shape_btn.setToolTip("Draw a custom ship by selecting cells in the shape painter.")
         ship_btns.addWidget(self.add_shape_btn)
         self.edit_ship_btn = QtWidgets.QPushButton("Edit")
         self.edit_ship_btn.clicked.connect(self._edit_ship)
@@ -368,6 +380,9 @@ class LayoutsTab(QtWidgets.QWidget):
         self.remove_ship_btn.clicked.connect(self._remove_ship)
         ship_btns.addWidget(self.remove_ship_btn)
         ship_layout.addLayout(ship_btns)
+        ship_hint = QtWidgets.QLabel("Add line = straight ship. Add shape = custom cells.")
+        ship_hint.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
+        ship_layout.addWidget(ship_hint)
         right_layout.addWidget(ship_group)
 
         action_row = QtWidgets.QHBoxLayout()
@@ -389,6 +404,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.status_label.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
         self.status_label.setWordWrap(True)
         right_layout.addWidget(self.status_label)
+        self._set_edit_enabled(False)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -426,7 +442,27 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_specs = []
         self._refresh_ship_table()
         self._update_layout_summary()
-        self.status_label.setText("Create a new layout or copy the active one.")
+        self.status_label.setText("Click New to start a layout, then name it to unlock editing.")
+        self._set_edit_enabled(False)
+
+    def _set_edit_enabled(self, enabled: bool):
+        self._edit_mode = bool(enabled)
+        self.name_input.setEnabled(enabled)
+        self._on_name_changed(self.name_input.text())
+
+    def _on_name_changed(self, text: str):
+        can_edit = self._edit_mode and bool(str(text).strip())
+        self.board_spin.setEnabled(can_edit)
+        self.touch_cb.setEnabled(can_edit)
+        self.ship_table.setEnabled(can_edit)
+        self.add_line_btn.setEnabled(can_edit)
+        self.add_shape_btn.setEnabled(can_edit)
+        self.edit_ship_btn.setEnabled(can_edit)
+        self.remove_ship_btn.setEnabled(can_edit)
+        self.save_btn.setEnabled(can_edit)
+        self.activate_btn.setEnabled(can_edit)
+        if self._edit_mode and not can_edit:
+            self.status_label.setText("Enter a layout name to unlock editing.")
 
     def _refresh_ship_table(self):
         self.ship_table.setRowCount(len(self.ship_specs))
@@ -476,7 +512,8 @@ class LayoutsTab(QtWidgets.QWidget):
         self.ship_specs = list(layout.ships)
         self._refresh_ship_table()
         self._update_layout_summary()
-        self.status_label.setText(f"Editing {layout.name} (v{layout.layout_version})")
+        self.status_label.setText(f"Viewing {layout.name} (v{layout.layout_version}). Click New to edit.")
+        self._set_edit_enabled(False)
 
     def _add_ship(self, kind: str):
         dialog = ShipDialog(parent=self)
@@ -506,6 +543,8 @@ class LayoutsTab(QtWidgets.QWidget):
         self.current_layout_id = None
         self.ship_specs = []
         self._clear_editor()
+        self._set_edit_enabled(True)
+        self.status_label.setText("Name the layout to unlock editing.")
 
     def duplicate_layout(self):
         row = self.layout_list.currentRow()
@@ -518,6 +557,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.touch_cb.setChecked(layout.allow_touching)
         self.ship_specs = list(layout.ships)
         self._refresh_ship_table()
+        self._set_edit_enabled(True)
         self.status_label.setText("Duplicated layout. Save to create a new custom layout.")
 
     def copy_active_layout(self):
@@ -530,6 +570,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.touch_cb.setChecked(active.allow_touching)
         self.ship_specs = list(active.ships)
         self._refresh_ship_table()
+        self._set_edit_enabled(True)
         self.status_label.setText("Copied active layout. Save to create a new custom layout.")
 
     def delete_layout(self):
