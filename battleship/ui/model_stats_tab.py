@@ -91,7 +91,9 @@ class ModelStatsTab(QtWidgets.QWidget):
         self.placements = layout_runtime.placements
 
         # Strategy definitions
-        self.model_defs = model_defs()
+        self._base_model_defs = [dict(md) for md in model_defs()]
+        self.model_defs = [dict(md) for md in self._base_model_defs]
+        self.model_overrides: Dict[str, Dict[str, str]] = {}
 
         self.model_stats: Dict[str, Dict[str, object]] = {}
         self.param_sweeps: Dict[str, List[Dict[str, object]]] = {}
@@ -104,6 +106,8 @@ class ModelStatsTab(QtWidgets.QWidget):
 
         self._build_ui()
         self.load_state()
+        self._apply_model_overrides()
+        self._refresh_model_combo()
         self.refresh_table()
         self.update_summary_label()
         try:
@@ -126,9 +130,7 @@ class ModelStatsTab(QtWidgets.QWidget):
         controls.setVerticalSpacing(8)
 
         self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.addItem("All models")
-        for md in self.model_defs:
-            self.model_combo.addItem(md["name"])
+        self._refresh_model_combo()
         controls.addWidget(QtWidgets.QLabel("Model:"), 0, 0)
         controls.addWidget(self.model_combo, 0, 1)
 
@@ -183,6 +185,7 @@ class ModelStatsTab(QtWidgets.QWidget):
         )
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.cellDoubleClicked.connect(self.open_model_details)
         layout.addWidget(self.table)
 
@@ -259,6 +262,7 @@ class ModelStatsTab(QtWidgets.QWidget):
             "param_sweeps": self.param_sweeps,
             "best_model_overall": self.best_model_overall,
             "best_model_by_phase": self.best_model_by_phase,
+            "model_overrides": self.model_overrides,
         }
         save_layout_state(path, self.layout, state)
 
@@ -300,10 +304,68 @@ class ModelStatsTab(QtWidgets.QWidget):
             self.best_model_by_phase = {
                 k: v for k, v in best_by_phase.items() if isinstance(k, str) and isinstance(v, str)
             }
+        overrides = data.get("model_overrides")
+        if isinstance(overrides, dict):
+            cleaned: Dict[str, Dict[str, str]] = {}
+            for key, payload in overrides.items():
+                if not isinstance(key, str) or not isinstance(payload, dict):
+                    continue
+                name = payload.get("name")
+                notes = payload.get("notes")
+                entry: Dict[str, str] = {}
+                if isinstance(name, str) and name.strip():
+                    entry["name"] = name.strip()
+                if isinstance(notes, str) and notes.strip():
+                    entry["notes"] = notes.strip()
+                if entry:
+                    cleaned[key] = entry
+            self.model_overrides = cleaned
         self._ensure_all_models()
         self.stale_label.setText("")
 
     # ---------------- Stats merge + table ----------------
+
+    def _apply_model_overrides(self) -> None:
+        self.model_defs = [dict(md) for md in self._base_model_defs]
+        for md in self.model_defs:
+            key = md.get("key")
+            if not key or key not in self.model_overrides:
+                continue
+            override = self.model_overrides.get(key, {})
+            name = override.get("name")
+            notes = override.get("notes")
+            if isinstance(name, str) and name.strip():
+                md["name"] = name.strip()
+            if isinstance(notes, str) and notes.strip():
+                md["notes"] = notes.strip()
+
+    def _refresh_model_combo(self) -> None:
+        try:
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            self.model_combo.addItem("All models")
+            for md in self.model_defs:
+                self.model_combo.addItem(md.get("name", md.get("key", "Model")))
+        finally:
+            self.model_combo.blockSignals(False)
+
+    def update_model_override(self, model_key: str, name: str, notes: str) -> None:
+        key = str(model_key or "").strip()
+        if not key:
+            return
+        payload: Dict[str, str] = {}
+        if isinstance(name, str) and name.strip():
+            payload["name"] = name.strip()
+        if isinstance(notes, str) and notes.strip():
+            payload["notes"] = notes.strip()
+        if payload:
+            self.model_overrides[key] = payload
+        else:
+            self.model_overrides.pop(key, None)
+        self._apply_model_overrides()
+        self._refresh_model_combo()
+        self.refresh_table()
+        self.save_state()
 
     def _merge_model_stats(self, key: str, delta: Dict[str, object]):
         self._ensure_all_models()
@@ -1882,6 +1944,7 @@ class ModelDetailDialog(QtWidgets.QDialog):
         self.stats_tab = stats_tab
         self.worker: Optional[CustomSimWorker] = None
         self.progress: Optional[QtWidgets.QProgressDialog] = None
+        self._model_key = str(model_def.get("key") or "")
 
         self.setWindowTitle(f"Analysis: {model_def.get('name', model_def.get('key', 'Model'))}")
         self.resize(900, 650)
@@ -1898,7 +1961,7 @@ class ModelDetailDialog(QtWidgets.QDialog):
         title.setFont(f)
         main_layout.addWidget(title)
 
-        # Notes / Description
+        # Notes / Description + personal overrides
         notes_label = QtWidgets.QLabel("Model Notes:")
         notes_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-weight: bold; margin-top: 10px;")
         main_layout.addWidget(notes_label)
@@ -1915,6 +1978,37 @@ class ModelDetailDialog(QtWidgets.QDialog):
             f"background-color: {Theme.BG_PANEL}; border: 1px solid {Theme.BG_BUTTON}; color: {Theme.TEXT_MAIN};"
         )
         main_layout.addWidget(desc_box)
+
+        override_name = ""
+        override_notes = ""
+        try:
+            if self.stats_tab is not None and self._model_key:
+                override = self.stats_tab.model_overrides.get(self._model_key, {})
+                if isinstance(override, dict):
+                    override_name = str(override.get("name") or "")
+                    override_notes = str(override.get("notes") or "")
+        except Exception:
+            pass
+
+        edit_group = QtWidgets.QGroupBox("Personal label & notes")
+        edit_layout = QtWidgets.QFormLayout(edit_group)
+
+        self.custom_name_input = QtWidgets.QLineEdit()
+        self.custom_name_input.setPlaceholderText("Leave blank to use default name")
+        self.custom_name_input.setText(override_name)
+        edit_layout.addRow("Display name", self.custom_name_input)
+
+        self.custom_notes_edit = QtWidgets.QTextEdit()
+        self.custom_notes_edit.setPlaceholderText("Personal notes (saved locally)")
+        self.custom_notes_edit.setPlainText(override_notes)
+        self.custom_notes_edit.setMaximumHeight(90)
+        edit_layout.addRow("Personal notes", self.custom_notes_edit)
+
+        self.save_overrides_btn = QtWidgets.QPushButton("Save personal edits")
+        self.save_overrides_btn.clicked.connect(self._save_overrides)
+        edit_layout.addRow("", self.save_overrides_btn)
+
+        main_layout.addWidget(edit_group)
 
         # Stats & Graph
         mid_layout = QtWidgets.QHBoxLayout()
@@ -2017,6 +2111,15 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         main_layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+
+    def _save_overrides(self) -> None:
+        if self.stats_tab is None or not self._model_key:
+            return
+        name = self.custom_name_input.text()
+        notes = self.custom_notes_edit.toPlainText()
+        self.stats_tab.update_model_override(self._model_key, name, notes)
+        title_name = name.strip() or self.model_def.get("name") or self._model_key
+        self.setWindowTitle(f"Analysis: {title_name}")
 
     def _refresh_saved_sweeps_button(self):
         if not hasattr(self, "btn_saved_sweeps"):

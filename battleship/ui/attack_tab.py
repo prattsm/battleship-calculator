@@ -190,9 +190,10 @@ class AttackTab(QtWidgets.QWidget):
         board_container.setFixedSize(grid_size, grid_size)
 
         board_scroll = wrap_scroll(board_container)
-        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         board_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        board_scroll.setAlignment(QtCore.Qt.AlignCenter)
         left_layout.addWidget(board_scroll, stretch=1)
 
         quick_group = QtWidgets.QGroupBox("Quick actions")

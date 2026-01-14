@@ -122,9 +122,10 @@ class DefenseTab(QtWidgets.QWidget):
         board_container.setFixedSize(grid_size, grid_size)
 
         board_scroll = wrap_scroll(board_container)
-        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         board_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        board_scroll.setAlignment(QtCore.Qt.AlignCenter)
         splitter.addWidget(board_scroll)
 
         right_panel = QtWidgets.QWidget()
