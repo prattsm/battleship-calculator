@@ -2,6 +2,7 @@ import itertools
 import json
 import math
 import random
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -813,6 +814,69 @@ def _sweep_values(min_v: float, max_v: float, step: float) -> List[float]:
     return out
 
 
+def _count_values_for_range(min_v: float, max_v: float, step: float) -> int:
+    """Count how many values will be generated for a sweep (inclusive endpoints)."""
+    if step <= 0:
+        return 0
+    lo = min(min_v, max_v)
+    hi = max(min_v, max_v)
+    n = int(math.floor((hi - lo) / step + 1e-12)) + 1
+    return max(0, n)
+
+
+def _values_for_range(min_v: float, max_v: float, step: float, is_int: bool) -> List[float]:
+    if step <= 0:
+        return [min_v]
+    lo = min(min_v, max_v)
+    hi = max(min_v, max_v)
+
+    if is_int:
+        lo_i = int(round(lo))
+        hi_i = int(round(hi))
+        st_i = max(1, int(round(step)))
+        return [float(v) for v in range(lo_i, hi_i + 1, st_i)]
+
+    out: List[float] = []
+    v = float(lo)
+    eps = abs(step) * 1.0e-9 + 1.0e-12
+    cap = 5000
+    while v <= hi + eps and len(out) < cap:
+        out.append(float(round(v, 10)))
+        v += step
+    if out and abs(out[-1] - hi) <= eps:
+        out[-1] = float(hi)
+    return out
+
+
+def _grid_from_params(params: List[Dict[str, object]], step_scale: float = 1.0, centers: Optional[Dict[str, float]] = None,
+                      spans: Optional[Dict[str, float]] = None) -> List[Dict[str, float]]:
+    keys: List[str] = []
+    value_lists: List[List[float]] = []
+    for p in params:
+        key = str(p.get("key"))
+        min_v = float(p.get("min", 0.0))
+        max_v = float(p.get("max", 0.0))
+        step = float(p.get("step", 1.0)) * float(step_scale)
+        is_int = bool(p.get("is_int", False))
+
+        if spans and centers and key in centers and key in spans:
+            center = float(centers[key])
+            span = float(spans[key])
+            min_v = max(min_v, center - span)
+            max_v = min(max_v, center + span)
+
+        values = _values_for_range(min_v, max_v, step, is_int)
+        if not values:
+            values = [min_v]
+        keys.append(key)
+        value_lists.append(values)
+
+    grid: List[Dict[str, float]] = []
+    for combo in itertools.product(*value_lists):
+        grid.append({k: float(v) for k, v in zip(keys, combo)})
+    return grid
+
+
 class ParamSweepWorker(QtCore.QThread):
     """Runs a parameter sweep for a given strategy off the UI thread.
 
@@ -828,18 +892,28 @@ class ParamSweepWorker(QtCore.QThread):
     result = QtCore.pyqtSignal(object, int)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, strategy: str, placements, ship_ids: List[str], board_size: int, games_per: int, param_grid: List[Dict[str, float]]):
+    def __init__(
+        self,
+        strategy: str,
+        placements,
+        ship_ids: List[str],
+        board_size: int,
+        games_per: int,
+        sweep_config: Dict[str, object],
+    ):
         super().__init__()
         self.strategy = strategy
         self.placements = placements
         self.ship_ids = list(ship_ids)
         self.board_size = int(board_size)
         self.games_per = int(games_per)
-        self.param_grid = list(param_grid)
+        self.sweep_config = dict(sweep_config)
         self._cancelled = False
         self.was_cancelled = False
         self.results = []
         self.points_completed = 0
+        self.stop_reason = "completed"
+        self.elapsed_seconds = 0.0
 
     def cancel(self):
         self._cancelled = True
@@ -857,68 +931,144 @@ class ParamSweepWorker(QtCore.QThread):
         total_cells = self.board_size * self.board_size
         points_completed = 0
 
-        for sweep_idx, params in enumerate(self.param_grid, start=1):
+        config = self.sweep_config or {}
+        params = list(config.get("params") or [])
+        mode = str(config.get("mode") or "grid")
+        coarse_factor = float(config.get("coarse_factor") or 2.0)
+        refine_top_n = int(config.get("refine_top_n") or 1)
+        max_points = int(config.get("max_points") or 0)
+        time_budget_s = float(config.get("time_budget_s") or 0.0)
+        early_stop = int(config.get("early_stop_no_improve") or 0)
+
+        key_order = [str(p.get("key")) for p in params]
+        seen = set()
+        best_avg = None
+        no_improve = 0
+        start = time.monotonic()
+
+        def _param_tuple(pdict: Dict[str, float]) -> tuple:
+            return tuple(round(float(pdict.get(k, 0.0)), 10) for k in key_order)
+
+        def _should_stop() -> bool:
+            nonlocal points_completed
             if self._cancelled:
                 self.was_cancelled = True
-                break
+                self.stop_reason = "cancelled"
+                return True
+            if max_points > 0 and points_completed >= max_points:
+                self.stop_reason = "point_budget"
+                return True
+            if time_budget_s > 0 and (time.monotonic() - start) >= time_budget_s:
+                self.stop_reason = "time_budget"
+                return True
+            if early_stop > 0 and no_improve >= early_stop:
+                self.stop_reason = "early_stop"
+                return True
+            return False
 
-            total_shots = 0
-            sum_sq = 0
-            ran = 0
-            min_shots = None
-            max_shots = None
-            hist = [0] * (total_cells + 1)
+        def _span_for_param(p: Dict[str, object], factor: float) -> float:
+            base_step = float(p.get("step", 1.0))
+            if bool(p.get("is_int", False)):
+                return float(max(1, int(round(base_step * factor))))
+            return float(base_step * factor)
 
-            # Run the batch for this parameter point
-            for _ in range(self.games_per):
-                if self._cancelled:
-                    self.was_cancelled = True
+        def _run_grid(grid: List[Dict[str, float]]) -> None:
+            nonlocal points_completed, best_avg, no_improve
+            for params_dict in grid:
+                if _should_stop():
+                    break
+                key = _param_tuple(params_dict)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                total_shots = 0
+                sum_sq = 0
+                ran = 0
+                min_shots = None
+                max_shots = None
+                hist = [0] * (total_cells + 1)
+
+                for _ in range(self.games_per):
+                    if self._cancelled:
+                        self.was_cancelled = True
+                        self.stop_reason = "cancelled"
+                        break
+
+                    shots = simulate_model_game(
+                        self.strategy,
+                        self.placements,
+                        self.ship_ids,
+                        self.board_size,
+                        rng=rng,
+                        params=params_dict,
+                    )
+                    total_shots += shots
+                    sum_sq += shots * shots
+                    ran += 1
+
+                    if min_shots is None or shots < min_shots:
+                        min_shots = shots
+                    if max_shots is None or shots > max_shots:
+                        max_shots = shots
+
+                    if 0 <= shots <= total_cells:
+                        hist[shots] += 1
+
+                if ran > 0:
+                    avg = total_shots / ran
+                    var = max(0.0, (sum_sq / ran) - (avg * avg))
+                    std = math.sqrt(var)
+                    results.append({
+                        "params": dict(params_dict),
+                        "games": ran,
+                        "avg": avg,
+                        "std": std,
+                        "min": int(min_shots) if min_shots is not None else 0,
+                        "max": int(max_shots) if max_shots is not None else 0,
+                        "hist": hist,
+                    })
+                    points_completed += 1
+
+                    if best_avg is None or avg < best_avg:
+                        best_avg = avg
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+
+                self.progress.emit(points_completed)
+
+                if self.was_cancelled:
                     break
 
-                shots = simulate_model_game(
-                    self.strategy,
-                    self.placements,
-                    self.ship_ids,
-                    self.board_size,
-                    rng=rng,
-                    params=params,
-                )
-                total_shots += shots
-                sum_sq += shots * shots
-                ran += 1
+        # Stage 1: base or coarse grid
+        if mode == "coarse_to_fine":
+            coarse_grid = _grid_from_params(params, step_scale=max(1.0, coarse_factor))
+            _run_grid(coarse_grid)
 
-                if min_shots is None or shots < min_shots:
-                    min_shots = shots
-                if max_shots is None or shots > max_shots:
-                    max_shots = shots
+            if not _should_stop() and results and refine_top_n > 0:
+                candidates = sorted(results, key=lambda r: float(r.get("avg", math.inf)))
+                top = candidates[:max(1, refine_top_n)]
+                spans = {str(p.get("key")): _span_for_param(p, max(1.0, coarse_factor)) for p in params}
+                for best in top:
+                    if _should_stop():
+                        break
+                    centers = best.get("params", {}) or {}
+                    refine_grid = _grid_from_params(params, step_scale=1.0, centers=centers, spans=spans)
+                    _run_grid(refine_grid)
+        else:
+            grid = _grid_from_params(params, step_scale=1.0)
+            _run_grid(grid)
 
-                if 0 <= shots <= total_cells:
-                    hist[shots] += 1
-
-            if ran > 0:
-                avg = total_shots / ran
-                var = max(0.0, (sum_sq / ran) - (avg * avg))
-                std = math.sqrt(var)
-                results.append({
-                    "params": dict(params),
-                    "games": ran,
-                    "avg": avg,
-                    "std": std,
-                    "min": int(min_shots) if min_shots is not None else 0,
-                    "max": int(max_shots) if max_shots is not None else 0,
-                    "hist": hist,
-                })
-                points_completed += 1
-
-            # progress per sweep point (not per game)
-            self.progress.emit(sweep_idx)
-
-            if self.was_cancelled:
-                break
+        self.elapsed_seconds = max(0.0, time.monotonic() - start)
+        if self.was_cancelled:
+            self.stop_reason = "cancelled"
+        elif self.stop_reason == "completed" and (max_points or time_budget_s or early_stop):
+            # If budgets were present but we didn't trigger, keep completed.
+            self.stop_reason = "completed"
 
         self.results = results
         self.points_completed = points_completed
-        # Emit results last; consumer should NOT delete the thread object here.
         self.result.emit(results, points_completed)
 
 
@@ -1262,7 +1412,7 @@ class SweepResultsDialog(QtWidgets.QDialog):
 class ParamSweepDialog(QtWidgets.QDialog):
     """Configure a parameter sweep for a tunable model.
 
-    Returns (games_per_setting, param_grid) where param_grid is a list[dict[str,float]].
+    Returns a sweep config dict with ranges, mode, budgets, and games per setting.
     """
 
     MAX_TOTAL_CONFIGS = 20000  # safety cap to avoid accidental massive sweeps
@@ -1272,9 +1422,17 @@ class ParamSweepDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Parameter Sweep: {model_name}")
         self.model_key = model_key
         self.inputs = {}  # key -> (min_sb, max_sb, step_sb)
+        self.param_widgets = {}  # key -> (min_sb, max_sb, step_sb, is_int)
         self.sb_games = None
         self.lbl_total = None
+        self.mode_combo = None
+        self.sb_coarse_factor = None
+        self.sb_refine_top = None
+        self.sb_max_points = None
+        self.sb_time_budget = None
+        self.sb_early_stop = None
         self._total_configs = 0
+        self._estimated_points = 0
         self._build_ui()
 
     def _build_ui(self):
@@ -1310,6 +1468,64 @@ class ParamSweepDialog(QtWidgets.QDialog):
         self.lbl_total = QtWidgets.QLabel("")
         self.lbl_total.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         grid.addWidget(self.lbl_total, r, 2, 1, 3)
+
+        r += 1
+        lbl_mode = QtWidgets.QLabel("Sweep mode:")
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("Standard grid", "grid")
+        self.mode_combo.addItem("Coarse → fine", "coarse_to_fine")
+        self.mode_combo.currentIndexChanged.connect(self._update_counts)
+        grid.addWidget(lbl_mode, r, 0)
+        grid.addWidget(self.mode_combo, r, 1)
+        mode_hint = QtWidgets.QLabel("Coarse → fine runs a wider first pass, then refines around the best settings.")
+        mode_hint.setWordWrap(True)
+        mode_hint.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
+        grid.addWidget(mode_hint, r, 2, 1, 3)
+
+        r += 1
+        lbl_coarse = QtWidgets.QLabel("Coarse factor:")
+        self.sb_coarse_factor = QtWidgets.QDoubleSpinBox()
+        self.sb_coarse_factor.setRange(1.0, 10.0)
+        self.sb_coarse_factor.setSingleStep(0.5)
+        self.sb_coarse_factor.setValue(2.0)
+        self.sb_coarse_factor.valueChanged.connect(self._update_counts)
+        lbl_refine = QtWidgets.QLabel("Refine top N:")
+        self.sb_refine_top = QtWidgets.QSpinBox()
+        self.sb_refine_top.setRange(1, 10)
+        self.sb_refine_top.setValue(1)
+        self.sb_refine_top.valueChanged.connect(self._update_counts)
+        grid.addWidget(lbl_coarse, r, 0)
+        grid.addWidget(self.sb_coarse_factor, r, 1)
+        grid.addWidget(lbl_refine, r, 2)
+        grid.addWidget(self.sb_refine_top, r, 3)
+
+        r += 1
+        lbl_max_points = QtWidgets.QLabel("Max points:")
+        self.sb_max_points = QtWidgets.QSpinBox()
+        self.sb_max_points.setRange(0, self.MAX_TOTAL_CONFIGS)
+        self.sb_max_points.setValue(0)
+        self.sb_max_points.setToolTip("0 = no limit")
+        self.sb_max_points.valueChanged.connect(self._update_counts)
+        lbl_time = QtWidgets.QLabel("Time budget (sec):")
+        self.sb_time_budget = QtWidgets.QSpinBox()
+        self.sb_time_budget.setRange(0, 36000)
+        self.sb_time_budget.setValue(0)
+        self.sb_time_budget.setToolTip("0 = no limit")
+        self.sb_time_budget.valueChanged.connect(self._update_counts)
+        grid.addWidget(lbl_max_points, r, 0)
+        grid.addWidget(self.sb_max_points, r, 1)
+        grid.addWidget(lbl_time, r, 2)
+        grid.addWidget(self.sb_time_budget, r, 3)
+
+        r += 1
+        lbl_early = QtWidgets.QLabel("Early stop (no-improve points):")
+        self.sb_early_stop = QtWidgets.QSpinBox()
+        self.sb_early_stop.setRange(0, self.MAX_TOTAL_CONFIGS)
+        self.sb_early_stop.setValue(0)
+        self.sb_early_stop.setToolTip("0 = disable")
+        self.sb_early_stop.valueChanged.connect(self._update_counts)
+        grid.addWidget(lbl_early, r, 0)
+        grid.addWidget(self.sb_early_stop, r, 1)
 
         r += 1
         line = QtWidgets.QFrame()
@@ -1385,6 +1601,7 @@ class ParamSweepDialog(QtWidgets.QDialog):
             grid.addWidget(lbl_count, r, 4)
 
             self.inputs[key] = (sb_min, sb_max, sb_step, lbl_count, is_int)
+            self.param_widgets[key] = (sb_min, sb_max, sb_step, is_int)
 
         layout.addLayout(grid)
 
@@ -1460,24 +1677,60 @@ class ParamSweepDialog(QtWidgets.QDialog):
 
     def _update_counts(self):
         total = 1
+        coarse_total = 1
+        refine_total = 1
+        coarse_factor = float(self.sb_coarse_factor.value()) if self.sb_coarse_factor is not None else 2.0
+        refine_top = int(self.sb_refine_top.value()) if self.sb_refine_top is not None else 1
+
+        mode = "grid"
+        if self.mode_combo is not None:
+            mode = str(self.mode_combo.currentData() or "grid")
+
         # Update per-param counts
         for key, (sb_min, sb_max, sb_step, lbl_count, is_int) in self.inputs.items():
             min_v = float(sb_min.value())
             max_v = float(sb_max.value())
             step = float(sb_step.value())
-            n = self._count_for_range(min_v, max_v, step)
+            n = _count_values_for_range(min_v, max_v, step)
             lbl_count.setText(str(n))
             total *= max(1, n)
 
+            if mode == "coarse_to_fine":
+                if is_int:
+                    coarse_step = max(1.0, float(int(round(step * coarse_factor))))
+                else:
+                    coarse_step = max(step, step * coarse_factor)
+                coarse_n = _count_values_for_range(min_v, max_v, coarse_step)
+                coarse_total *= max(1, coarse_n)
+
+                span = min(max_v - min_v, 2.0 * coarse_step)
+                refine_n = _count_values_for_range(0.0, max(0.0, span), step)
+                refine_total *= max(1, refine_n)
+
+        if mode == "coarse_to_fine":
+            est_total = coarse_total + (max(1, refine_top) * refine_total)
+        else:
+            est_total = total
+
         self._total_configs = total
+        self._estimated_points = est_total
+
+        if self.sb_coarse_factor is not None:
+            self.sb_coarse_factor.setEnabled(mode == "coarse_to_fine")
+        if self.sb_refine_top is not None:
+            self.sb_refine_top.setEnabled(mode == "coarse_to_fine")
+
         if self.lbl_total is not None:
-            if total > self.MAX_TOTAL_CONFIGS:
+            if est_total > self.MAX_TOTAL_CONFIGS:
                 self.lbl_total.setText(
-                    f"Total configs: {total:,} (over cap {self.MAX_TOTAL_CONFIGS:,})"
+                    f"Estimated configs: {est_total:,} (over cap {self.MAX_TOTAL_CONFIGS:,})"
                 )
                 self.lbl_total.setStyleSheet("color: #ff6666; font-weight: bold;")
             else:
-                self.lbl_total.setText(f"Total configs: {total:,}")
+                if mode == "coarse_to_fine":
+                    self.lbl_total.setText(f"Estimated configs: {est_total:,} (coarse {coarse_total:,})")
+                else:
+                    self.lbl_total.setText(f"Total configs: {est_total:,}")
                 self.lbl_total.setStyleSheet(f"color: {Theme.HIGHLIGHT}; font-weight: bold;")
 
     def accept(self):
@@ -1496,11 +1749,11 @@ class ParamSweepDialog(QtWidgets.QDialog):
         # Recompute (in case user never changed focus)
         self._update_counts()
 
-        if self._total_configs > self.MAX_TOTAL_CONFIGS:
+        if self._estimated_points > self.MAX_TOTAL_CONFIGS:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Sweep Too Large",
-                f"This sweep would run {self._total_configs:,} configurations.\n\nPlease reduce the ranges or increase the step size so the total is <= {self.MAX_TOTAL_CONFIGS:,}.",
+                f"This sweep would run about {self._estimated_points:,} configurations.\n\nPlease reduce the ranges or increase the step size so the total is <= {self.MAX_TOTAL_CONFIGS:,}.",
             )
             return
 
@@ -1508,26 +1761,38 @@ class ParamSweepDialog(QtWidgets.QDialog):
 
     def get_config(self):
         games = int(self.sb_games.value()) if self.sb_games is not None else 200
+        mode = "grid"
+        if self.mode_combo is not None:
+            mode = str(self.mode_combo.currentData() or "grid")
+        coarse_factor = float(self.sb_coarse_factor.value()) if self.sb_coarse_factor is not None else 2.0
+        refine_top = int(self.sb_refine_top.value()) if self.sb_refine_top is not None else 1
+        max_points = int(self.sb_max_points.value()) if self.sb_max_points is not None else 0
+        time_budget_s = float(self.sb_time_budget.value()) if self.sb_time_budget is not None else 0.0
+        early_stop = int(self.sb_early_stop.value()) if self.sb_early_stop is not None else 0
 
-        # Build a list of values for each key
-        value_lists = []
-        keys = []
+        params = []
         for key, (sb_min, sb_max, sb_step, _lbl_count, is_int) in self.inputs.items():
-            min_v = float(sb_min.value())
-            max_v = float(sb_max.value())
-            step = float(sb_step.value())
-            values = self._values_for_range(min_v, max_v, step, is_int)
-            # Ensure at least one value
-            if not values:
-                values = [min_v]
-            keys.append(key)
-            value_lists.append(values)
+            params.append(
+                {
+                    "key": str(key),
+                    "min": float(sb_min.value()),
+                    "max": float(sb_max.value()),
+                    "step": float(sb_step.value()),
+                    "is_int": bool(is_int),
+                }
+            )
 
-        grid = []
-        for combo in itertools.product(*value_lists):
-            grid.append({k: float(v) for k, v in zip(keys, combo)})
-
-        return games, grid
+        return {
+            "games_per": games,
+            "params": params,
+            "mode": mode,
+            "coarse_factor": coarse_factor,
+            "refine_top_n": refine_top,
+            "max_points": max_points,
+            "time_budget_s": time_budget_s,
+            "early_stop_no_improve": early_stop,
+            "estimated_points": int(self._estimated_points),
+        }
 
 
 class ParamTestDialog(QtWidgets.QDialog):
@@ -1991,7 +2256,8 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
 
-        games_per, param_grid = dlg.get_config()
+        sweep_config = dlg.get_config()
+        games_per = int(sweep_config.get("games_per", 200))
         self._last_sweep_games_per = int(games_per)
         if hasattr(self, "btn_sweep"):
             self.btn_sweep.setEnabled(False)
@@ -1999,28 +2265,41 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         self._sweep_cancel_requested = False
         ranges = {}
         try:
-            for k, (sb_min, sb_max, sb_step) in dlg.param_widgets.items():
-                ranges[str(k)] = {
-                    "min": float(sb_min.value()),
-                    "max": float(sb_max.value()),
-                    "step": float(sb_step.value()),
+            for p in sweep_config.get("params", []):
+                if not isinstance(p, dict):
+                    continue
+                key = str(p.get("key"))
+                ranges[key] = {
+                    "min": float(p.get("min", 0.0)),
+                    "max": float(p.get("max", 0.0)),
+                    "step": float(p.get("step", 0.0)),
                 }
         except Exception:
             ranges = {}
 
+        estimated_points = int(sweep_config.get("estimated_points") or 0)
         self._last_sweep_meta = {
             "id": datetime.now().strftime("%Y%m%d_%H%M%S"),
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "model_key": self.model_def.get("key"),
             "model_name": self.model_def.get("name"),
             "games_per_point": int(games_per),
-            "grid_size": int(len(param_grid)),
+            "grid_size": int(estimated_points),
             "ranges": ranges,
+            "mode": sweep_config.get("mode", "grid"),
+            "coarse_factor": sweep_config.get("coarse_factor"),
+            "refine_top_n": sweep_config.get("refine_top_n"),
+            "max_points": sweep_config.get("max_points"),
+            "time_budget_s": sweep_config.get("time_budget_s"),
+            "early_stop_no_improve": sweep_config.get("early_stop_no_improve"),
         }
-        if not param_grid:
+        if estimated_points <= 0:
             return
 
-        total_cfg = len(param_grid)
+        max_points = int(sweep_config.get("max_points") or 0)
+        total_cfg = estimated_points
+        if max_points > 0:
+            total_cfg = min(total_cfg, max_points)
         self.sweep_progress = QtWidgets.QProgressDialog("Sweeping parameters...", "Cancel", 0, total_cfg, self)
         self.sweep_progress.setWindowModality(QtCore.Qt.WindowModal)
         self.sweep_progress.setMinimumDuration(0)
@@ -2034,7 +2313,7 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
             self.stats_tab.ship_ids,
             self.stats_tab.board_size,
             games_per,
-            param_grid,
+            sweep_config,
         )
         self.sweep_worker.progress.connect(self._on_sweep_progress)
         self.sweep_worker.result.connect(self.on_sweep_finished)
@@ -2048,6 +2327,16 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         """Handle completion of a parameter sweep."""
         debug_event(self, "Sweep finished",
                     f"ran={ran} results={len(results) if results else 0} cancel={getattr(self, '_sweep_cancel_requested', False)}")
+
+        try:
+            worker = getattr(self, "sweep_worker", None)
+            meta = getattr(self, "_last_sweep_meta", None)
+            if worker is not None and isinstance(meta, dict):
+                meta["points_completed"] = int(getattr(worker, "points_completed", ran))
+                meta["stop_reason"] = getattr(worker, "stop_reason", None)
+                meta["elapsed_seconds"] = float(getattr(worker, "elapsed_seconds", 0.0))
+        except Exception:
+            pass
 
         try:
             # Close progress and re-enable UI safely
