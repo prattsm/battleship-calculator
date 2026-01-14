@@ -44,6 +44,28 @@ def apply_dark_palette(app: QtWidgets.QApplication):
     palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
 
     app.setPalette(palette)
+    app.setStyleSheet(
+        "\n".join(
+            [
+                "QCheckBox::indicator, QRadioButton::indicator {",
+                "  width: 16px;",
+                "  height: 16px;",
+                f"  border: 1px solid {Theme.TEXT_LABEL};",
+                f"  background-color: {Theme.BG_BUTTON};",
+                "}",
+                "QCheckBox::indicator:checked, QRadioButton::indicator:checked {",
+                f"  background-color: {Theme.TEXT_LABEL};",
+                f"  border: 1px solid {Theme.TEXT_MAIN};",
+                "}",
+                "QRadioButton::indicator {",
+                "  border-radius: 8px;",
+                "}",
+                "QCheckBox::indicator {",
+                "  border-radius: 3px;",
+                "}",
+            ]
+        )
+    )
 
 
 class MainWindow(QtWidgets.QMainWindow):

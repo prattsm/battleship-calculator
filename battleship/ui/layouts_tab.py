@@ -134,6 +134,10 @@ class ShipDialog(QtWidgets.QDialog):
         self._on_kind_changed()
         self._build_shape_grid(self.grid_size)
 
+    def _restore_position(self, pos: QtCore.QPoint) -> None:
+        # Re-apply the original position after layout updates to avoid window drift.
+        QtCore.QTimer.singleShot(0, lambda: self.move(pos))
+
     def _on_kind_changed(self):
         is_line = self.kind_combo.currentText() == "line"
         self.length_spin.setEnabled(is_line)
@@ -160,7 +164,6 @@ class ShipDialog(QtWidgets.QDialog):
             self._sync_grid_from_text()
 
     def _build_shape_grid(self, size: int):
-        pos = self.pos()
         for i in reversed(range(self.grid_layout.count())):
             item = self.grid_layout.itemAt(i)
             widget = item.widget()
@@ -182,7 +185,6 @@ class ShipDialog(QtWidgets.QDialog):
                 row.append(btn)
                 self.grid_layout.addWidget(btn, r, c)
             self.grid_buttons.append(row)
-        self.move(pos)
 
     def _resize_grid(self):
         pos = self.pos()
@@ -196,7 +198,7 @@ class ShipDialog(QtWidgets.QDialog):
             if r < size and c < size:
                 self.grid_buttons[r][c].setChecked(True)
         self._sync_text_from_grid()
-        self.move(pos)
+        self._restore_position(pos)
 
     def _grid_cells(self) -> Tuple[Tuple[int, int], ...]:
         cells = []
@@ -233,7 +235,7 @@ class ShipDialog(QtWidgets.QDialog):
             self.grid_spin.setValue(self.grid_size)
             self.grid_spin.blockSignals(False)
             self._build_shape_grid(self.grid_size)
-            self.move(pos)
+            self._restore_position(pos)
         self._clear_grid(update_text=False)
         for r, c in cells:
             if r < self.grid_size and c < self.grid_size:
