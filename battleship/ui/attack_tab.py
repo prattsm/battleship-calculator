@@ -1,5 +1,6 @@
 import math
 import random
+import uuid
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -25,11 +26,11 @@ from battleship.domain.worlds import (
     sample_worlds,
 )
 from battleship.layouts.cache import LayoutRuntime
-from battleship.persistence.layout_state import delete_layout_state, load_layout_state, save_layout_state
+from battleship.persistence.layout_state import load_layout_state, save_layout_state
 from battleship.persistence.model_selection import load_best_models
 from battleship.persistence.stats import StatsTracker
 from battleship.sim.defense_sim import build_base_heat, simulate_enemy_game_phase
-from battleship.strategies.selection import two_ply_selection
+from battleship.strategies.selection import _choose_next_shot_for_strategy, two_ply_selection
 from battleship.strategies.registry import model_defs
 from battleship.ui.theme import Theme
 
@@ -93,6 +94,21 @@ class AttackTab(QtWidgets.QWidget):
         self.active_phase: str = PHASE_HUNT
 
         self.linked_defense_tab = None
+
+        # Opponent learning (layout priors)
+        self.opponents: Dict[str, Dict[str, object]] = {}
+        self.active_opponent_id: Optional[str] = None
+        self._loading_opponent = False
+        self.opponent_cell_counts: List[float] = [0.0] * (self.board_size * self.board_size)
+        self.opponent_layouts_recorded: int = 0
+        self._using_opponent_prior: bool = False
+        self._opponent_prior_confidence: float = 0.0
+        self._opponent_prior_total: float = 0.0
+
+        # Lookahead rollouts
+        self.rollout_enabled: bool = False
+        self.rollout_count: int = 16
+        self.rollout_top_k: int = 6
 
         # World-model diagnostics
         self.enumeration_mode: bool = False  # True = exact enumeration, False = Monte Carlo
@@ -302,6 +318,10 @@ class AttackTab(QtWidgets.QWidget):
         self.world_mode_label.setWordWrap(True)
         insights_layout.addWidget(self.world_mode_label)
 
+        self.opponent_prior_label = QtWidgets.QLabel("")
+        self.opponent_prior_label.setWordWrap(True)
+        insights_layout.addWidget(self.opponent_prior_label)
+
         self.best_label = QtWidgets.QLabel("Best guess: (none)")
         self.best_label.setWordWrap(True)
         insights_layout.addWidget(self.best_label)
@@ -341,6 +361,61 @@ class AttackTab(QtWidgets.QWidget):
         model_layout.addWidget(self.active_model_label)
 
         models_layout.addWidget(model_group)
+
+        opponent_group = QtWidgets.QGroupBox("Opponent learning")
+        opponent_layout = QtWidgets.QVBoxLayout(opponent_group)
+        opp_row = QtWidgets.QHBoxLayout()
+        opp_row.addWidget(QtWidgets.QLabel("Opponent:"))
+        self.opponent_combo = QtWidgets.QComboBox()
+        self.opponent_combo.currentIndexChanged.connect(self._on_opponent_changed)
+        opp_row.addWidget(self.opponent_combo, stretch=1)
+        self.opponent_add_btn = QtWidgets.QPushButton("Add")
+        self.opponent_add_btn.clicked.connect(self._add_opponent)
+        opp_row.addWidget(self.opponent_add_btn)
+        self.opponent_rename_btn = QtWidgets.QPushButton("Rename")
+        self.opponent_rename_btn.clicked.connect(self._rename_opponent)
+        opp_row.addWidget(self.opponent_rename_btn)
+        self.opponent_delete_btn = QtWidgets.QPushButton("Delete")
+        self.opponent_delete_btn.clicked.connect(self._delete_opponent)
+        opp_row.addWidget(self.opponent_delete_btn)
+        opponent_layout.addLayout(opp_row)
+
+        self.opponent_stats_label = QtWidgets.QLabel("")
+        self.opponent_stats_label.setWordWrap(True)
+        opponent_layout.addWidget(self.opponent_stats_label)
+
+        self.record_layout_btn = QtWidgets.QPushButton("Record opponent layout")
+        self.record_layout_btn.clicked.connect(self._record_opponent_layout)
+        opponent_layout.addWidget(self.record_layout_btn)
+
+        models_layout.addWidget(opponent_group)
+
+        rollout_group = QtWidgets.QGroupBox("Lookahead rollouts")
+        rollout_layout = QtWidgets.QVBoxLayout(rollout_group)
+        self.rollout_enable_cb = QtWidgets.QCheckBox("Enable lookahead (slower)")
+        self.rollout_enable_cb.toggled.connect(self._rollout_settings_changed)
+        rollout_layout.addWidget(self.rollout_enable_cb)
+        roll_row = QtWidgets.QHBoxLayout()
+        roll_row.addWidget(QtWidgets.QLabel("Rollouts:"))
+        self.rollout_count_spin = QtWidgets.QSpinBox()
+        self.rollout_count_spin.setRange(2, 200)
+        self.rollout_count_spin.setValue(self.rollout_count)
+        self.rollout_count_spin.valueChanged.connect(self._rollout_settings_changed)
+        roll_row.addWidget(self.rollout_count_spin)
+        roll_row.addWidget(QtWidgets.QLabel("Top cells:"))
+        self.rollout_top_spin = QtWidgets.QSpinBox()
+        self.rollout_top_spin.setRange(2, 20)
+        self.rollout_top_spin.setValue(self.rollout_top_k)
+        self.rollout_top_spin.valueChanged.connect(self._rollout_settings_changed)
+        roll_row.addWidget(self.rollout_top_spin)
+        roll_row.addStretch(1)
+        rollout_layout.addLayout(roll_row)
+
+        self.rollout_summary_label = QtWidgets.QLabel("")
+        self.rollout_summary_label.setWordWrap(True)
+        rollout_layout.addWidget(self.rollout_summary_label)
+
+        models_layout.addWidget(rollout_group)
         models_layout.addStretch(1)
         tabs.addTab(wrap_scroll(models), "Models")
 
@@ -495,6 +570,333 @@ class AttackTab(QtWidgets.QWidget):
         self.manual_rb.blockSignals(False)
         self.model_combo.blockSignals(False)
         self.lock_model_cb.blockSignals(False)
+
+    def _new_opponent_profile(self, name: str) -> Dict[str, object]:
+        return {
+            "name": name,
+            "cell_counts": [0.0] * (self.board_size * self.board_size),
+            "layouts_recorded": 0,
+        }
+
+    def _export_opponent_profile(self) -> Dict[str, object]:
+        return {
+            "name": self._current_opponent_name(),
+            "cell_counts": list(self.opponent_cell_counts),
+            "layouts_recorded": int(self.opponent_layouts_recorded),
+        }
+
+    def _import_opponent_profile(self, profile: Dict[str, object]) -> None:
+        self._loading_opponent = True
+        try:
+            counts = profile.get("cell_counts")
+            if (
+                isinstance(counts, list)
+                and len(counts) == self.board_size * self.board_size
+                and all(isinstance(v, (int, float)) for v in counts)
+            ):
+                self.opponent_cell_counts = [float(v) for v in counts]
+            else:
+                self.opponent_cell_counts = [0.0] * (self.board_size * self.board_size)
+
+            layouts = profile.get("layouts_recorded")
+            if isinstance(layouts, int) and layouts >= 0:
+                self.opponent_layouts_recorded = layouts
+            else:
+                self.opponent_layouts_recorded = 0
+        finally:
+            self._loading_opponent = False
+        self._update_opponent_stats_label()
+
+    def _current_opponent_name(self) -> str:
+        if self.active_opponent_id and self.active_opponent_id in self.opponents:
+            name = self.opponents[self.active_opponent_id].get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return "Opponent"
+
+    def _refresh_opponent_combo(self, select_id: Optional[str] = None) -> None:
+        if not hasattr(self, "opponent_combo"):
+            return
+        self.opponent_combo.blockSignals(True)
+        self.opponent_combo.clear()
+        for oid, profile in self.opponents.items():
+            name = profile.get("name") if isinstance(profile, dict) else None
+            label = str(name).strip() if isinstance(name, str) and name.strip() else oid
+            self.opponent_combo.addItem(label, userData=oid)
+        if select_id:
+            for i in range(self.opponent_combo.count()):
+                if self.opponent_combo.itemData(i) == select_id:
+                    self.opponent_combo.setCurrentIndex(i)
+                    break
+        self.opponent_combo.blockSignals(False)
+
+    def _ensure_opponents(self) -> None:
+        if not self.opponents:
+            oid = f"opp_{uuid.uuid4().hex[:8]}"
+            self.opponents[oid] = self._new_opponent_profile("Opponent 1")
+            self.active_opponent_id = oid
+        if self.active_opponent_id not in self.opponents:
+            self.active_opponent_id = next(iter(self.opponents))
+        self._refresh_opponent_combo(self.active_opponent_id)
+
+    def _save_current_profile(self) -> None:
+        if not self.active_opponent_id:
+            return
+        self.opponents[self.active_opponent_id] = self._export_opponent_profile()
+
+    def _on_opponent_changed(self, index: int) -> None:
+        if self._loading_opponent:
+            return
+        if index < 0:
+            return
+        new_id = self.opponent_combo.itemData(index)
+        if not isinstance(new_id, str) or not new_id:
+            return
+        if new_id == self.active_opponent_id:
+            return
+        self._save_current_profile()
+        self.active_opponent_id = new_id
+        profile = self.opponents.get(new_id)
+        if isinstance(profile, dict):
+            self._import_opponent_profile(profile)
+        self.save_state()
+        self.recompute()
+
+    def _add_opponent(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add Opponent", "Opponent name:")
+        if not ok:
+            return
+        name = str(name).strip() or "Opponent"
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        self.opponents[oid] = self._new_opponent_profile(name)
+        self._save_current_profile()
+        self.active_opponent_id = oid
+        self._refresh_opponent_combo(oid)
+        self._import_opponent_profile(self.opponents[oid])
+        self.save_state()
+        self.recompute()
+
+    def _rename_opponent(self) -> None:
+        if not self.active_opponent_id:
+            return
+        current_name = self._current_opponent_name()
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename Opponent", "Opponent name:", text=current_name)
+        if not ok:
+            return
+        name = str(name).strip() or current_name
+        profile = self.opponents.get(self.active_opponent_id, {})
+        if isinstance(profile, dict):
+            profile["name"] = name
+            self.opponents[self.active_opponent_id] = profile
+        self._refresh_opponent_combo(self.active_opponent_id)
+        self.save_state()
+
+    def _delete_opponent(self) -> None:
+        if not self.active_opponent_id:
+            return
+        if len(self.opponents) <= 1:
+            QtWidgets.QMessageBox.information(self, "Cannot delete", "At least one opponent profile is required.")
+            return
+        name = self._current_opponent_name()
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Opponent",
+            f"Delete opponent profile '{name}'?\nThis cannot be undone.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        del self.opponents[self.active_opponent_id]
+        self.active_opponent_id = next(iter(self.opponents))
+        self._refresh_opponent_combo(self.active_opponent_id)
+        self._import_opponent_profile(self.opponents[self.active_opponent_id])
+        self.save_state()
+        self.recompute()
+
+    def _update_opponent_stats_label(self) -> None:
+        if not hasattr(self, "opponent_stats_label"):
+            return
+        total = sum(self.opponent_cell_counts)
+        total_i = int(round(total))
+        self.opponent_stats_label.setText(
+            f"Layouts recorded: {self.opponent_layouts_recorded}. "
+            f"Ship cells observed: {total_i}."
+        )
+
+    def _record_opponent_layout(self) -> None:
+        dialog = OpponentLayoutDialog(self.board_size, self._expected_ship_cells(), parent=self)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        cells = dialog.selected_cells()
+        if not cells:
+            QtWidgets.QMessageBox.information(self, "No cells selected", "No ship cells were selected.")
+            return
+        expected = self._expected_ship_cells()
+        if expected > 0 and len(cells) != expected:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Confirm layout",
+                f"Selected {len(cells)} cells, expected {expected}.\nSave anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        for r, c in cells:
+            idx = cell_index(r, c, self.board_size)
+            if 0 <= idx < len(self.opponent_cell_counts):
+                self.opponent_cell_counts[idx] += 1.0
+        self.opponent_layouts_recorded += 1
+        self._update_opponent_stats_label()
+        self._save_current_profile()
+        self.save_state()
+        self.recompute()
+
+    def _compute_opponent_prior(self) -> Optional[List[float]]:
+        counts = self.opponent_cell_counts
+        if not counts:
+            self._using_opponent_prior = False
+            self._opponent_prior_confidence = 0.0
+            self._opponent_prior_total = 0.0
+            return None
+
+        total = float(sum(counts))
+        self._opponent_prior_total = total
+        if total <= 0.0:
+            self._using_opponent_prior = False
+            self._opponent_prior_confidence = 0.0
+            return None
+
+        total_cells = self.board_size * self.board_size
+        smoothing = 1.0
+        uniform = 1.0 / total_cells
+        denom = total + smoothing * total_cells
+        normalized = [(float(c) + smoothing) / denom for c in counts]
+
+        # Confidence rises with more observed ship cells.
+        blend_k = max(1.0, float(self._expected_ship_cells()) * 6.0)
+        confidence = total / (total + blend_k)
+        confidence = max(0.0, min(1.0, confidence))
+        self._opponent_prior_confidence = confidence
+        self._using_opponent_prior = True
+
+        if confidence <= 0.0:
+            return None
+        if confidence >= 1.0:
+            return normalized
+        return [confidence * normalized[i] + (1.0 - confidence) * uniform for i in range(total_cells)]
+
+    def _rollout_settings_changed(self) -> None:
+        self.rollout_enabled = bool(self.rollout_enable_cb.isChecked())
+        self.rollout_count = int(self.rollout_count_spin.value())
+        self.rollout_top_k = int(self.rollout_top_spin.value())
+        self.save_state()
+        self.recompute()
+
+    def _simulate_rollout_after_shot(
+        self,
+        base_board: List[List[str]],
+        world_mask: int,
+        first_shot: Tuple[int, int],
+        model_key: str,
+        rng: random.Random,
+    ) -> int:
+        sim_board = [row[:] for row in base_board]
+        total_targets = int(bin(world_mask).count("1"))
+        hits = 0
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if sim_board[r][c] == HIT:
+                    idx = cell_index(r, c, self.board_size)
+                    if (world_mask >> idx) & 1:
+                        hits += 1
+        remaining = max(0, total_targets - hits)
+
+        shots = 0
+        fr, fc = first_shot
+        if sim_board[fr][fc] == EMPTY:
+            idx = cell_index(fr, fc, self.board_size)
+            is_hit = (world_mask >> idx) & 1
+            sim_board[fr][fc] = HIT if is_hit else MISS
+            shots += 1
+            if is_hit:
+                remaining -= 1
+
+        max_shots = self.board_size * self.board_size
+        while remaining > 0 and shots < max_shots:
+            r, c = _choose_next_shot_for_strategy(
+                model_key,
+                sim_board,
+                self.placements,
+                rng,
+                self.ship_ids,
+                board_size=self.board_size,
+            )
+            if sim_board[r][c] != EMPTY:
+                # Safety: pick a random unknown if strategy returns a known cell.
+                unknown = [
+                    (rr, cc)
+                    for rr in range(self.board_size)
+                    for cc in range(self.board_size)
+                    if sim_board[rr][cc] == EMPTY
+                ]
+                if not unknown:
+                    break
+                r, c = rng.choice(unknown)
+            idx = cell_index(r, c, self.board_size)
+            is_hit = (world_mask >> idx) & 1
+            sim_board[r][c] = HIT if is_hit else MISS
+            shots += 1
+            if is_hit:
+                remaining -= 1
+        return shots
+
+    def _apply_rollout_lookahead(
+        self,
+        candidates: List[Dict[str, object]],
+        higher_better: bool,
+        model_key: str,
+    ) -> Optional[Tuple[Tuple[int, int], float]]:
+        if not self.rollout_enabled:
+            return None
+        if not candidates or not self.world_masks:
+            return None
+
+        rollouts = max(2, int(self.rollout_count))
+        top_k = max(2, int(self.rollout_top_k))
+
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda e: (e["score"], e.get("p_hit", 0.0)),
+            reverse=higher_better,
+        )
+        eval_cells = [entry["cell"] for entry in candidates_sorted[:top_k]]
+        if not eval_cells:
+            return None
+
+        rng = random.Random()
+        if len(self.world_masks) <= rollouts:
+            world_samples = list(self.world_masks)
+        else:
+            world_samples = rng.sample(self.world_masks, rollouts)
+
+        if not world_samples:
+            return None
+
+        best_cell = None
+        best_avg = None
+
+        for cell in eval_cells:
+            total = 0.0
+            for wmask in world_samples:
+                total += self._simulate_rollout_after_shot(self.board, wmask, cell, model_key, rng)
+            avg = total / len(world_samples)
+            if best_avg is None or avg < best_avg:
+                best_avg = avg
+                best_cell = cell
+
+        if best_cell is None or best_avg is None:
+            return None
+        return best_cell, float(best_avg)
 
     def _model_mode_changed(self):
         if self.auto_phase_rb.isChecked():
@@ -1106,6 +1508,7 @@ class AttackTab(QtWidgets.QWidget):
         """
         if path is None:
             path = self.STATE_PATH
+        self._save_current_profile()
 
         # Serialize assigned_hits as lists of [r, c]
         assigned_hits_serializable = {
@@ -1127,6 +1530,11 @@ class AttackTab(QtWidgets.QWidget):
             "manual_model_key": self.manual_model_key,
             "lock_model_for_game": bool(self.lock_model_cb.isChecked()),
             "locked_model_key": self.locked_model_key,
+            "opponents": self.opponents,
+            "active_opponent_id": self.active_opponent_id,
+            "rollout_enabled": bool(self.rollout_enabled),
+            "rollout_count": int(self.rollout_count),
+            "rollout_top_k": int(self.rollout_top_k),
         }
         save_layout_state(path, self.layout, state)
 
@@ -1141,12 +1549,72 @@ class AttackTab(QtWidgets.QWidget):
             path = self.STATE_PATH
         data, _raw = load_layout_state(path, self.layout)
         if not data:
+            self._ensure_opponents()
+            profile = self.opponents.get(self.active_opponent_id, {})
+            if isinstance(profile, dict):
+                self._import_opponent_profile(profile)
             return
+
+        opponents = data.get("opponents")
+        if isinstance(opponents, dict) and opponents:
+            self.opponents = opponents
+            active = data.get("active_opponent_id")
+            if isinstance(active, str) and active in self.opponents:
+                self.active_opponent_id = active
+            else:
+                self.active_opponent_id = next(iter(self.opponents))
+            self._ensure_opponents()
+            profile = self.opponents.get(self.active_opponent_id, {})
+            if isinstance(profile, dict):
+                self._import_opponent_profile(profile)
+        else:
+            self._ensure_opponents()
+            profile = self.opponents.get(self.active_opponent_id, {})
+            if isinstance(profile, dict):
+                self._import_opponent_profile(profile)
+
+        rollout_enabled = data.get("rollout_enabled")
+        if isinstance(rollout_enabled, bool):
+            self.rollout_enabled = rollout_enabled
+        rollout_count = data.get("rollout_count")
+        if isinstance(rollout_count, int):
+            self.rollout_count = max(2, rollout_count)
+        rollout_top_k = data.get("rollout_top_k")
+        if isinstance(rollout_top_k, int):
+            self.rollout_top_k = max(2, rollout_top_k)
+
+        if hasattr(self, "rollout_enable_cb"):
+            self.rollout_enable_cb.blockSignals(True)
+            self.rollout_enable_cb.setChecked(self.rollout_enabled)
+            self.rollout_enable_cb.blockSignals(False)
+        if hasattr(self, "rollout_count_spin"):
+            self.rollout_count_spin.blockSignals(True)
+            self.rollout_count_spin.setValue(self.rollout_count)
+            self.rollout_count_spin.blockSignals(False)
+        if hasattr(self, "rollout_top_spin"):
+            self.rollout_top_spin.blockSignals(True)
+            self.rollout_top_spin.setValue(self.rollout_top_k)
+            self.rollout_top_spin.blockSignals(False)
+
+        auto_mode = data.get("auto_mode")
+        if auto_mode in {self.AUTO_MODE_PHASE, self.AUTO_MODE_OVERALL, self.AUTO_MODE_MANUAL}:
+            self.auto_mode = auto_mode
+        manual_key = data.get("manual_model_key")
+        if isinstance(manual_key, str):
+            known_keys = {md["key"] for md in self.attack_model_defs}
+            if manual_key in known_keys:
+                self.manual_model_key = manual_key
+        lock_flag = data.get("lock_model_for_game")
+        if isinstance(lock_flag, bool):
+            self.lock_model_for_game = lock_flag
+        locked_key = data.get("locked_model_key")
+        if isinstance(locked_key, str):
+            self.locked_model_key = locked_key
+        self._update_model_controls()
 
         # If the last saved game was already marked as over,
         # treat that as a finished game and do NOT restore it.
         if data.get("game_over", False):
-            delete_layout_state(path, self.layout)
             return
 
         board = data.get("board")
@@ -1202,21 +1670,6 @@ class AttackTab(QtWidgets.QWidget):
         if isinstance(overlay_mode, int) and 0 <= overlay_mode < self.overlay_combo.count():
             self.overlay_combo.setCurrentIndex(overlay_mode)
 
-        auto_mode = data.get("auto_mode")
-        if auto_mode in {self.AUTO_MODE_PHASE, self.AUTO_MODE_OVERALL, self.AUTO_MODE_MANUAL}:
-            self.auto_mode = auto_mode
-        manual_key = data.get("manual_model_key")
-        if isinstance(manual_key, str):
-            known_keys = {md["key"] for md in self.attack_model_defs}
-            if manual_key in known_keys:
-                self.manual_model_key = manual_key
-        lock_flag = data.get("lock_model_for_game")
-        if isinstance(lock_flag, bool):
-            self.lock_model_for_game = lock_flag
-        locked_key = data.get("locked_model_key")
-        if isinstance(locked_key, str):
-            self.locked_model_key = locked_key
-        self._update_model_controls()
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._update_history_buttons()
@@ -1308,8 +1761,8 @@ class AttackTab(QtWidgets.QWidget):
         self.locked_model_key = None
         self.recompute()
 
-        # Optional: also wipe any saved in-progress state
-        delete_layout_state(self.STATE_PATH, self.layout)
+        # Persist cleared board without dropping opponent history.
+        self.save_state()
 
     def _are_all_ships_sunk(self) -> bool:
         # Only trust the user's explicit checkboxes for "game over".
@@ -1365,10 +1818,13 @@ class AttackTab(QtWidgets.QWidget):
                 if defense_tab.layout_board[r][c] == HAS_SHIP:
                     layout_mask |= (1 << cell_index(r, c, self.board_size))
 
-        base_heat = [
-            build_base_heat(defense_tab.hit_counts_phase[p], defense_tab.miss_counts_phase[p], self.board_size)
-            for p in range(4)
-        ]
+        if hasattr(defense_tab, "_build_base_heat_phase"):
+            base_heat, _pattern = defense_tab._build_base_heat_phase()
+        else:
+            base_heat = [
+                build_base_heat(defense_tab.hit_counts_phase[p], defense_tab.miss_counts_phase[p], self.board_size)
+                for p in range(4)
+            ]
 
         opp_rem_samples = []
         for _ in range(10):
@@ -1403,6 +1859,7 @@ class AttackTab(QtWidgets.QWidget):
 
     def recompute(self, defense_tab=None):
         # Rebuild world samples and ship-sunk probabilities
+        cell_prior = self._compute_opponent_prior()
         self.world_masks, self.cell_hit_counts, self.ship_sunk_probs, self.num_world_samples = sample_worlds(
             self.board,
             self.placements,
@@ -1410,6 +1867,7 @@ class AttackTab(QtWidgets.QWidget):
             self.confirmed_sunk,
             self.assigned_hits,
             board_size=self.board_size,
+            cell_prior=cell_prior,
         )
 
         N = self.num_world_samples
@@ -1451,6 +1909,8 @@ class AttackTab(QtWidgets.QWidget):
                 # Endgame: only one ship left -> always enumerate in sample_worlds.
                 enumeration = True
 
+            if cell_prior is not None:
+                enumeration = False
             self.enumeration_mode = enumeration
         else:
             # No consistent layouts found - mode doesn't really matter.
@@ -1514,6 +1974,15 @@ class AttackTab(QtWidgets.QWidget):
                 self.best_cells = []
                 self.best_prob = 0.0
 
+        rollout_note = ""
+        if not self.game_over and N > 0 and candidates:
+            rollout_result = self._apply_rollout_lookahead(candidates, higher_better, model_key)
+            if rollout_result is not None:
+                best_cell, avg_shots = rollout_result
+                self.best_cells = [best_cell]
+                self.best_prob = self.cell_probs[cell_index(best_cell[0], best_cell[1], self.board_size)]
+                rollout_note = f"Lookahead: expected remaining shots ~{avg_shots:.1f}"
+
         warnings = self._compute_warnings()
         self.warning_label.setText(warnings)
 
@@ -1526,6 +1995,8 @@ class AttackTab(QtWidgets.QWidget):
 
         self._update_explanation_panel(candidates, score_label, higher_better, note)
         self._update_whatif_preview()
+        if hasattr(self, "rollout_summary_label"):
+            self.rollout_summary_label.setText(rollout_note)
 
         self.update_board_view()
         self.update_status_view()
@@ -1688,6 +2159,18 @@ class AttackTab(QtWidgets.QWidget):
                 f"World model: {mode_str}, layouts ≈ {self.num_world_samples}"
             )
 
+        if hasattr(self, "opponent_prior_label"):
+            if not self._using_opponent_prior or self._opponent_prior_total <= 0.0:
+                self.opponent_prior_label.setText(
+                    "Opponent prior: none (record layouts to bias sampling)."
+                )
+            else:
+                conf_pct = int(round(self._opponent_prior_confidence * 100))
+                self.opponent_prior_label.setText(
+                    f"Opponent prior: {self._current_opponent_name()} | "
+                    f"layouts recorded: {self.opponent_layouts_recorded}, confidence: {conf_pct}%"
+                )
+
         # Per-ship sunk probabilities
         for ship in self.ship_ids:
             lbl = self.ship_status_labels[ship]
@@ -1714,3 +2197,127 @@ class AttackTab(QtWidgets.QWidget):
                 f"{self.ship_friendly_names[ship]}: {status} (p≈{prob_display:.2f})"
             )
             lbl.setStyleSheet(f"color: {color};")
+
+
+class OpponentLayoutDialog(QtWidgets.QDialog):
+    def __init__(self, board_size: int, expected_cells: int, parent=None):
+        super().__init__(parent)
+        self.board_size = int(board_size)
+        self.expected_cells = int(expected_cells)
+        self._selected = [[False for _ in range(self.board_size)] for _ in range(self.board_size)]
+        self._buttons: List[List[QtWidgets.QToolButton]] = []
+
+        self.setWindowTitle("Record opponent layout")
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        hint = QtWidgets.QLabel(
+            "Click the cells where the opponent placed ships.\n"
+            "This is saved only on your device."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+        layout.addWidget(hint)
+
+        self.count_label = QtWidgets.QLabel("")
+        self.count_label.setWordWrap(True)
+        layout.addWidget(self.count_label)
+
+        board_container = QtWidgets.QWidget()
+        board_layout = QtWidgets.QGridLayout(board_container)
+        board_layout.setSpacing(2)
+        board_layout.setContentsMargins(8, 8, 8, 8)
+        board_layout.setAlignment(QtCore.Qt.AlignCenter)
+
+        self._col_labels = []
+        for c in range(self.board_size):
+            lbl = QtWidgets.QLabel(chr(ord("A") + c))
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+            board_layout.addWidget(lbl, 0, c + 1)
+            self._col_labels.append(lbl)
+        for r in range(self.board_size):
+            lbl = QtWidgets.QLabel(str(r + 1))
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+            board_layout.addWidget(lbl, r + 1, 0)
+
+        cell = max(18, min(30, int(320 / max(1, self.board_size))))
+        for r in range(self.board_size):
+            row = []
+            for c in range(self.board_size):
+                btn = QtWidgets.QToolButton()
+                btn.setCheckable(True)
+                btn.setFixedSize(cell, cell)
+                btn.clicked.connect(self._make_toggle_handler(r, c))
+                self._apply_cell_style(btn, False)
+                board_layout.addWidget(btn, r + 1, c + 1)
+                row.append(btn)
+            self._buttons.append(row)
+
+        layout.addWidget(board_container)
+
+        action_row = QtWidgets.QHBoxLayout()
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear_cells)
+        action_row.addWidget(clear_btn)
+        action_row.addStretch(1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        action_row.addWidget(buttons)
+
+        layout.addLayout(action_row)
+
+        self._update_count_label()
+
+    def _make_toggle_handler(self, r: int, c: int):
+        def handler():
+            btn = self._buttons[r][c]
+            checked = btn.isChecked()
+            self._selected[r][c] = checked
+            self._apply_cell_style(btn, checked)
+            self._update_count_label()
+        return handler
+
+    def _apply_cell_style(self, btn: QtWidgets.QToolButton, checked: bool) -> None:
+        if checked:
+            btn.setStyleSheet(
+                f"background-color: {Theme.LAYOUT_SHIP_BG};"
+                f"color: {Theme.LAYOUT_SHIP_TEXT};"
+                f"border: 1px solid {Theme.LAYOUT_SHIP_BORDER};"
+            )
+        else:
+            btn.setStyleSheet(
+                f"background-color: {Theme.BG_DARK};"
+                f"color: {Theme.TEXT_MAIN};"
+                f"border: 1px solid {Theme.BORDER_EMPTY};"
+            )
+
+    def _clear_cells(self) -> None:
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                self._selected[r][c] = False
+                btn = self._buttons[r][c]
+                btn.setChecked(False)
+                self._apply_cell_style(btn, False)
+        self._update_count_label()
+
+    def _update_count_label(self) -> None:
+        count = sum(1 for r in range(self.board_size) for c in range(self.board_size) if self._selected[r][c])
+        if self.expected_cells > 0:
+            self.count_label.setText(f"Selected ship cells: {count} / {self.expected_cells}")
+        else:
+            self.count_label.setText(f"Selected ship cells: {count}")
+
+    def selected_cells(self) -> List[Tuple[int, int]]:
+        cells: List[Tuple[int, int]] = []
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self._selected[r][c]:
+                    cells.append((r, c))
+        return cells

@@ -8,7 +8,12 @@ from battleship.domain.board import cell_index
 from battleship.domain.config import DISP_RADIUS, HAS_SHIP, NO_SHIP, NO_SHOT, SHOT_HIT, SHOT_MISS
 from battleship.layouts.cache import LayoutRuntime
 from battleship.persistence.layout_state import load_layout_state, save_layout_state
-from battleship.sim.defense_sim import build_base_heat, recommend_layout_phase, simulate_enemy_game_phase
+from battleship.sim.defense_sim import (
+    build_base_heat,
+    recommend_layout_ga,
+    recommend_layout_phase,
+    simulate_enemy_game_phase,
+)
 from battleship.ui.theme import Theme
 
 
@@ -47,6 +52,7 @@ class DefenseTab(QtWidgets.QWidget):
             ]
             for _ in range(4)
         ]
+        self.start_counts: List[float] = [0.0, 0.0, 0.0, 0.0]
 
         self.history_events: List[Tuple[int, int, bool, int]] = []
         self.last_shot_for_sequence: Optional[Tuple[int, int, int, bool]] = None
@@ -260,6 +266,10 @@ class DefenseTab(QtWidgets.QWidget):
         self.summary_label.setWordWrap(True)
         analyze_layout.addWidget(self.summary_label)
 
+        self.pattern_label = QtWidgets.QLabel("")
+        self.pattern_label.setWordWrap(True)
+        analyze_layout.addWidget(self.pattern_label)
+
         self.recommendation_label = QtWidgets.QLabel(
             "No layout suggestion yet.\nRecord opponent shots, then click 'Suggest layout'."
         )
@@ -298,6 +308,9 @@ class DefenseTab(QtWidgets.QWidget):
             for _ in range(4)
         ]
 
+    def _blank_start_counts(self) -> List[float]:
+        return [0.0, 0.0, 0.0, 0.0]
+
     def _new_opponent_profile(self, name: str) -> Dict[str, object]:
         return {
             "name": name,
@@ -306,6 +319,7 @@ class DefenseTab(QtWidgets.QWidget):
             "hit_counts_phase": self._blank_phase_counts(),
             "miss_counts_phase": self._blank_phase_counts(),
             "disp_counts": self._blank_disp_counts(),
+            "start_counts": self._blank_start_counts(),
             "history_events": [],
             "last_shot_for_sequence": None,
             "mode_tab": 0,
@@ -322,6 +336,7 @@ class DefenseTab(QtWidgets.QWidget):
             "hit_counts_phase": self.hit_counts_phase,
             "miss_counts_phase": self.miss_counts_phase,
             "disp_counts": self.disp_counts,
+            "start_counts": list(self.start_counts),
             "history_events": [
                 [int(r), int(c), bool(was_hit), int(phase)]
                 for (r, c, was_hit, phase) in self.history_events
@@ -383,6 +398,12 @@ class DefenseTab(QtWidgets.QWidget):
                 self.disp_counts = dc
             else:
                 self.disp_counts = self._blank_disp_counts()
+
+            sc = profile.get("start_counts")
+            if isinstance(sc, list) and len(sc) == 4 and all(isinstance(v, (int, float)) for v in sc):
+                self.start_counts = [float(v) for v in sc]
+            else:
+                self.start_counts = self._blank_start_counts()
 
             self.history_events = []
             he = profile.get("history_events")
@@ -681,6 +702,9 @@ class DefenseTab(QtWidgets.QWidget):
                     for dc in range(2 * DISP_RADIUS + 1):
                         self.disp_counts[p][hm][dr][dc] *= factor
 
+        for i in range(len(self.start_counts)):
+            self.start_counts[i] *= factor
+
     def _compute_sunk_ship_count(self) -> int:
         visited = [[False for _ in range(self.board_size)] for _ in range(self.board_size)]
         sunk_count = 0
@@ -710,6 +734,22 @@ class DefenseTab(QtWidgets.QWidget):
                     sunk_count += 1
         return sunk_count
 
+    def _nearest_corner_index(self, r: int, c: int) -> int:
+        corners = [
+            (0, 0),
+            (0, self.board_size - 1),
+            (self.board_size - 1, 0),
+            (self.board_size - 1, self.board_size - 1),
+        ]
+        best_idx = 0
+        best_dist = None
+        for idx, (cr, cc) in enumerate(corners):
+            dist = abs(r - cr) + abs(c - cc)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
     def record_shot_at(self, r: int, c: int):
         has_ship = self.layout_board[r][c] == HAS_SHIP
         current = self.shot_board[r][c]
@@ -725,6 +765,10 @@ class DefenseTab(QtWidgets.QWidget):
                 self.shot_board[r][c] = SHOT_MISS
                 self.miss_counts_phase[phase][r][c] += 1
                 was_hit = False
+            if not self.history_events:
+                corner_idx = self._nearest_corner_index(r, c)
+                if 0 <= corner_idx < len(self.start_counts):
+                    self.start_counts[corner_idx] += 1.0
             self.history_events.append((r, c, was_hit, phase))
             if self.last_shot_for_sequence is not None:
                 lr, lc, last_phase, last_hit = self.last_shot_for_sequence
@@ -741,6 +785,10 @@ class DefenseTab(QtWidgets.QWidget):
                 er, ec, was_hit, phase = self.history_events[i]
                 if er == r and ec == c:
                     self.history_events.pop(i)
+                    if i == 0:
+                        corner_idx = self._nearest_corner_index(er, ec)
+                        if 0 <= corner_idx < len(self.start_counts) and self.start_counts[corner_idx] > 0:
+                            self.start_counts[corner_idx] -= 1.0
                     if was_hit:
                         if self.hit_counts_phase[phase][r][c] > 0:
                             self.hit_counts_phase[phase][r][c] -= 1
@@ -781,6 +829,7 @@ class DefenseTab(QtWidgets.QWidget):
                 for dr in range(2 * DISP_RADIUS + 1):
                     for dc in range(2 * DISP_RADIUS + 1):
                         self.disp_counts[p][hm][dr][dc] = 0
+        self.start_counts = self._blank_start_counts()
         self.history_events.clear()
         self.last_shot_for_sequence = None
         for r in range(self.board_size):
@@ -799,16 +848,31 @@ class DefenseTab(QtWidgets.QWidget):
         self.save_state()
 
     def compute_suggested_layout(self):
-        layout, mask, robust, avg_heat, avg_seq = recommend_layout_phase(
+        base_heat_phase, _pattern = self._build_base_heat_phase()
+        layout, mask, robust, avg_heat, avg_seq = recommend_layout_ga(
             self.hit_counts_phase,
             self.miss_counts_phase,
             self.disp_counts,
             self.placements,
             ship_ids=self.ship_ids,
             board_size=self.board_size,
-            n_iter=250,
-            sim_games_per_layout=10,
+            generations=18,
+            population_size=36,
+            sim_games_per_layout=8,
+            base_heat_phase=base_heat_phase,
         )
+        if layout is None:
+            layout, mask, robust, avg_heat, avg_seq = recommend_layout_phase(
+                self.hit_counts_phase,
+                self.miss_counts_phase,
+                self.disp_counts,
+                self.placements,
+                ship_ids=self.ship_ids,
+                board_size=self.board_size,
+                n_iter=250,
+                sim_games_per_layout=10,
+                base_heat_phase=base_heat_phase,
+            )
         if layout is None:
             self.recommended_layout = None
             self.recommended_mask = 0
@@ -907,6 +971,7 @@ class DefenseTab(QtWidgets.QWidget):
         self._eval_progress.setAutoClose(False)
         self._eval_progress.setAutoReset(False)
 
+        base_heat_phase, _pattern = self._build_base_heat_phase()
         self._eval_worker = DefenseEvalWorker(
             current_mask=current_mask,
             suggested_mask=suggested_mask,
@@ -916,6 +981,7 @@ class DefenseTab(QtWidgets.QWidget):
             hit_counts_phase=self.hit_counts_phase,
             miss_counts_phase=self.miss_counts_phase,
             disp_counts=self.disp_counts,
+            base_heat_phase=base_heat_phase,
             games_per_layout=games_per_layout,
             random_layouts=random_layouts,
         )
@@ -1008,6 +1074,159 @@ class DefenseTab(QtWidgets.QWidget):
                         total += self.disp_counts[p][hm][dr][dc]
         return total
 
+    def _quadrant_index(self, r: int, c: int) -> int:
+        mid = self.board_size // 2
+        top = r < mid
+        left = c < mid
+        if top and left:
+            return 0  # NW
+        if top and not left:
+            return 1  # NE
+        if not top and left:
+            return 2  # SW
+        return 3  # SE
+
+    def _compute_pattern_bias(self) -> Dict[str, object]:
+        total = 0.0
+        even = 0.0
+        quad_counts = [0.0, 0.0, 0.0, 0.0]
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                h, m = self._total_counts_cell(r, c)
+                v = float(h + m)
+                if v <= 0:
+                    continue
+                total += v
+                if (r + c) % 2 == 0:
+                    even += v
+                q = self._quadrant_index(r, c)
+                quad_counts[q] += v
+
+        pattern: Dict[str, object] = {"total_shots": total}
+        if total <= 0.0:
+            return pattern
+
+        odd = total - even
+        parity_bias = (even - odd) / total if total > 0 else 0.0
+        parity_strength = min(0.5, abs(parity_bias) * 1.2)
+        if abs(parity_bias) >= 0.08:
+            pattern["parity_pref"] = "even" if parity_bias >= 0 else "odd"
+            pattern["parity_strength"] = parity_strength
+            pattern["parity_bias"] = parity_bias
+
+        quad_shares = [q / total for q in quad_counts]
+        max_share = max(quad_shares)
+        max_idx = quad_shares.index(max_share)
+        quad_delta = max_share - 0.25
+        quad_strength = min(0.5, max(0.0, quad_delta * 3.0))
+        if quad_delta >= 0.06:
+            pattern["quadrant_pref"] = max_idx
+            pattern["quadrant_strength"] = quad_strength
+            pattern["quadrant_share"] = max_share
+
+        start_total = float(sum(self.start_counts))
+        pattern["start_total"] = start_total
+        if start_total > 0:
+            start_shares = [c / start_total for c in self.start_counts]
+            start_max = max(start_shares)
+            start_idx = start_shares.index(start_max)
+            start_delta = start_max - 0.25
+            start_strength = min(0.4, max(0.0, start_delta * 3.0))
+            if start_delta >= 0.10:
+                pattern["start_corner_pref"] = start_idx
+                pattern["start_corner_strength"] = start_strength
+                pattern["start_corner_share"] = start_max
+        return pattern
+
+    def _apply_pattern_bias(self, heat, pattern: Dict[str, object]):
+        if not pattern:
+            return heat
+
+        parity_pref = pattern.get("parity_pref")
+        parity_strength = float(pattern.get("parity_strength", 0.0) or 0.0)
+        quad_pref = pattern.get("quadrant_pref")
+        quad_strength = float(pattern.get("quadrant_strength", 0.0) or 0.0)
+        corner_pref = pattern.get("start_corner_pref")
+        corner_strength = float(pattern.get("start_corner_strength", 0.0) or 0.0)
+
+        if not parity_pref and quad_pref is None and corner_pref is None:
+            return heat
+
+        corners = [
+            (0, 0),
+            (0, self.board_size - 1),
+            (self.board_size - 1, 0),
+            (self.board_size - 1, self.board_size - 1),
+        ]
+        denom = max(1, (self.board_size - 1) * 2)
+
+        weighted = [[0.0 for _ in range(self.board_size)] for _ in range(self.board_size)]
+        total = 0.0
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                factor = 1.0
+                if parity_pref:
+                    is_even = (r + c) % 2 == 0
+                    if (parity_pref == "even") == is_even:
+                        factor *= 1.0 + parity_strength
+                if quad_pref is not None:
+                    if self._quadrant_index(r, c) == quad_pref:
+                        factor *= 1.0 + quad_strength
+                if corner_pref is not None:
+                    cr, cc = corners[int(corner_pref)]
+                    dist = abs(r - cr) + abs(c - cc)
+                    decay = max(0.0, 1.0 - (dist / denom))
+                    factor *= 1.0 + corner_strength * decay
+                val = heat[r][c] * factor
+                weighted[r][c] = val
+                total += val
+
+        if total <= 0:
+            return heat
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                weighted[r][c] /= total
+        return weighted
+
+    def _build_base_heat_phase(self):
+        base_heat_phase = [
+            build_base_heat(self.hit_counts_phase[p], self.miss_counts_phase[p], self.board_size)
+            for p in range(4)
+        ]
+        pattern = self._compute_pattern_bias()
+        for i in range(len(base_heat_phase)):
+            base_heat_phase[i] = self._apply_pattern_bias(base_heat_phase[i], pattern)
+        return base_heat_phase, pattern
+
+    def _pattern_summary_text(self, pattern: Dict[str, object]) -> str:
+        total = float(pattern.get("total_shots", 0.0) or 0.0)
+        if total <= 0:
+            return "Pattern bias: none yet (record more opponent shots)."
+
+        parts: List[str] = []
+        parity_pref = pattern.get("parity_pref")
+        if isinstance(parity_pref, str):
+            bias = float(pattern.get("parity_bias", 0.0) or 0.0)
+            parts.append(f"Parity: {parity_pref} ({bias:+.2f})")
+
+        quad_pref = pattern.get("quadrant_pref")
+        if isinstance(quad_pref, int):
+            names = ["NW", "NE", "SW", "SE"]
+            share = float(pattern.get("quadrant_share", 0.0) or 0.0)
+            label = names[quad_pref] if 0 <= quad_pref < len(names) else str(quad_pref)
+            parts.append(f"Quadrant: {label} ({share * 100:.0f}%)")
+
+        corner_pref = pattern.get("start_corner_pref")
+        if isinstance(corner_pref, int):
+            names = ["NW", "NE", "SW", "SE"]
+            share = float(pattern.get("start_corner_share", 0.0) or 0.0)
+            label = names[corner_pref] if 0 <= corner_pref < len(names) else str(corner_pref)
+            parts.append(f"Start corner: {label} ({share * 100:.0f}%)")
+
+        if not parts:
+            return "Pattern bias: none detected yet."
+        return "Pattern bias: " + " | ".join(parts)
+
     def update_summary_labels(self):
         total_hits, total_misses = self._total_hits_misses()
         total_shots = total_hits + total_misses
@@ -1032,6 +1251,9 @@ class DefenseTab(QtWidgets.QWidget):
         self.place_summary_label.setText(
             f"Current layout: {total_layout_cells} ship cells (ideal is ~{self.expected_ship_cells})."
         )
+        if hasattr(self, "pattern_label"):
+            pattern = self._compute_pattern_bias()
+            self.pattern_label.setText(self._pattern_summary_text(pattern))
 
     def update_board_view(self):
         show_heat = bool(self.heatmap_checkbox.isChecked()) if self.heatmap_checkbox is not None else False
@@ -1118,6 +1340,7 @@ class DefenseEvalWorker(QtCore.QThread):
         hit_counts_phase,
         miss_counts_phase,
         disp_counts,
+        base_heat_phase=None,
         games_per_layout: int,
         random_layouts: int,
     ):
@@ -1130,6 +1353,7 @@ class DefenseEvalWorker(QtCore.QThread):
         self.hit_counts_phase = hit_counts_phase
         self.miss_counts_phase = miss_counts_phase
         self.disp_counts = disp_counts
+        self.base_heat_phase = base_heat_phase
         self.games_per_layout = int(games_per_layout)
         self.random_layouts = int(random_layouts)
         self._cancelled = False
@@ -1203,10 +1427,12 @@ class DefenseEvalWorker(QtCore.QThread):
     def run(self):
         try:
             rng = random.Random()
-            base_heat_phase = [
-                build_base_heat(self.hit_counts_phase[p], self.miss_counts_phase[p], self.board_size)
-                for p in range(4)
-            ]
+            base_heat_phase = self.base_heat_phase
+            if base_heat_phase is None:
+                base_heat_phase = [
+                    build_base_heat(self.hit_counts_phase[p], self.miss_counts_phase[p], self.board_size)
+                    for p in range(4)
+                ]
 
             eval_targets = 0
             if self.current_mask:

@@ -42,11 +42,29 @@ def filter_allowed_placements(
     return filtered
 
 
+def _weighted_choice(rng: random.Random, options: List[PlacementLike], weights: Optional[List[float]] = None):
+    if not options:
+        return None
+    if not weights or len(weights) != len(options):
+        return rng.choice(options)
+    total = float(sum(weights))
+    if total <= 1e-12:
+        return rng.choice(options)
+    x = rng.random() * total
+    acc = 0.0
+    for opt, w in zip(options, weights):
+        acc += float(w)
+        if x <= acc:
+            return opt
+    return options[-1]
+
+
 def random_world(
     allowed: Dict[str, List[PlacementLike]],
     ship_ids: Sequence[str],
     hit_mask: int,
     rng: random.Random,
+    placement_weights: Optional[Dict[str, List[float]]] = None,
 ) -> Optional[Tuple[int, Tuple[int, ...]]]:
     used_mask = 0
     ship_masks: List[int] = []
@@ -58,7 +76,10 @@ def random_world(
             return None
         placed = False
         for _ in range(50):
-            p = rng.choice(options)
+            weights = placement_weights.get(ship) if placement_weights else None
+            p = _weighted_choice(rng, options, weights)
+            if p is None:
+                break
             if p.mask & used_mask:
                 continue
             used_mask |= p.mask
@@ -112,6 +133,7 @@ def sample_worlds(
     assigned_hits: Dict[str, Set[Tuple[int, int]]],
     rng_seed: Optional[int] = None,
     board_size: Optional[int] = None,
+    cell_prior: Optional[List[float]] = None,
 ) -> Tuple[List[int], List[int], Dict[str, float], int]:
     """
     Return:
@@ -152,6 +174,10 @@ def sample_worlds(
     else:
         enumeration = True
 
+    # If we have a cell prior, prefer Monte Carlo sampling to respect weights.
+    if cell_prior is not None and len(cell_prior) == board_size * board_size:
+        enumeration = False
+
     worlds_union: List[int] = []
     worlds_ship_masks: List[Tuple[int, ...]] = []
     seen: Set[int] = set()
@@ -166,10 +192,29 @@ def sample_worlds(
         rng = random.Random(rng_seed)
         attempts = 0
         max_attempts = WORLD_SAMPLE_TARGET * WORLD_MAX_ATTEMPTS_FACTOR
+        placement_weights: Optional[Dict[str, List[float]]] = None
+        if cell_prior is not None and len(cell_prior) == board_size * board_size:
+            placement_weights = {}
+            for ship, plist in allowed.items():
+                if not plist:
+                    placement_weights[ship] = []
+                    continue
+                weights = []
+                for p in plist:
+                    if not getattr(p, "cells", None):
+                        weights.append(1.0)
+                        continue
+                    s = 0.0
+                    for r, c in p.cells:
+                        idx = r * board_size + c
+                        if 0 <= idx < len(cell_prior):
+                            s += float(cell_prior[idx])
+                    weights.append(max(1e-6, s))
+                placement_weights[ship] = weights
 
         while len(worlds_union) < WORLD_SAMPLE_TARGET and attempts < max_attempts:
             attempts += 1
-            res = random_world(allowed, ship_ids, hit_mask, rng)
+            res = random_world(allowed, ship_ids, hit_mask, rng, placement_weights=placement_weights)
             if res is None:
                 continue
             union_mask, ship_masks_tuple = res

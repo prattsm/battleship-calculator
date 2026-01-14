@@ -243,12 +243,14 @@ def recommend_layout_phase(
     n_iter: int = 250,
     sim_games_per_layout: int = 3,
     rng_seed: Optional[int] = None,
+    base_heat_phase: Optional[List[List[List[float]]]] = None,
 ):
     rng = random.Random(rng_seed)
 
-    base_heat_phase = []
-    for p in range(4):
-        base_heat_phase.append(build_base_heat(hit_counts_phase[p], miss_counts_phase[p], board_size))
+    if base_heat_phase is None:
+        base_heat_phase = []
+        for p in range(4):
+            base_heat_phase.append(build_base_heat(hit_counts_phase[p], miss_counts_phase[p], board_size))
 
     scored_placements: Dict[str, List[Tuple[object, float]]] = {}
     for ship, plist in placements.items():
@@ -315,5 +317,186 @@ def recommend_layout_phase(
             best_mask = union_mask
             best_heat = avg_heat
             best_seq = avg_seq
+
+    return best_layout, best_mask, best_robust, best_heat, best_seq
+
+
+def recommend_layout_ga(
+    hit_counts_phase,
+    miss_counts_phase,
+    disp_counts,
+    placements: Dict[str, List[object]],
+    ship_ids: Optional[Sequence[str]] = None,
+    board_size: int = BOARD_SIZE,
+    generations: int = 18,
+    population_size: int = 36,
+    elite_frac: float = 0.25,
+    mutation_rate: float = 0.35,
+    sim_games_per_layout: int = 6,
+    rng_seed: Optional[int] = None,
+    base_heat_phase: Optional[List[List[List[float]]]] = None,
+):
+    rng = random.Random(rng_seed)
+
+    if base_heat_phase is None:
+        base_heat_phase = []
+        for p in range(4):
+            base_heat_phase.append(build_base_heat(hit_counts_phase[p], miss_counts_phase[p], board_size))
+
+    ship_order = list(ship_ids) if ship_ids is not None else sorted(placements.keys())
+    if not ship_order:
+        return None, 0, 0.0, 0.0, 0.0
+
+    scored_placements: Dict[str, List[Tuple[object, float]]] = {}
+    for ship, plist in placements.items():
+        tmp = []
+        for p in plist:
+            s = sum(base_heat_phase[0][r][c] for (r, c) in p.cells)
+            tmp.append((p, s))
+        tmp.sort(key=lambda ps: ps[1])
+        scored_placements[ship] = tmp
+
+    def build_random_layout() -> Optional[Tuple[List[object], int]]:
+        used_mask = 0
+        genes: List[object] = []
+        local_order = list(ship_order)
+        rng.shuffle(local_order)
+        gene_map: Dict[str, object] = {}
+        for ship in local_order:
+            candidates = scored_placements.get(ship, [])
+            if not candidates:
+                return None
+            placed = False
+            top_k = min(10, len(candidates))
+            for _ in range(50):
+                p, _ = rng.choice(candidates[:top_k])
+                if p.mask & used_mask:
+                    continue
+                used_mask |= p.mask
+                gene_map[ship] = p
+                placed = True
+                break
+            if not placed:
+                return None
+        for ship in ship_order:
+            genes.append(gene_map[ship])
+        return genes, used_mask
+
+    def repair_genes(genes: List[object]) -> Optional[Tuple[List[object], int]]:
+        used_mask = 0
+        repaired: List[object] = []
+        for ship, gene in zip(ship_order, genes):
+            if gene is not None and not (gene.mask & used_mask):
+                repaired.append(gene)
+                used_mask |= gene.mask
+                continue
+            candidates = placements.get(ship, [])
+            if not candidates:
+                return None
+            placed = False
+            for _ in range(50):
+                p = rng.choice(candidates)
+                if p.mask & used_mask:
+                    continue
+                repaired.append(p)
+                used_mask |= p.mask
+                placed = True
+                break
+            if not placed:
+                return None
+        return repaired, used_mask
+
+    def crossover(a: List[object], b: List[object]) -> Optional[Tuple[List[object], int]]:
+        genes = []
+        for ga, gb in zip(a, b):
+            genes.append(ga if rng.random() < 0.5 else gb)
+        return repair_genes(genes)
+
+    def mutate(genes: List[object]) -> Optional[Tuple[List[object], int]]:
+        mutated = list(genes)
+        for i, ship in enumerate(ship_order):
+            if rng.random() < mutation_rate:
+                options = placements.get(ship, [])
+                if options:
+                    mutated[i] = rng.choice(options)
+        return repair_genes(mutated)
+
+    def eval_mask(mask: int) -> Tuple[float, float, float]:
+        total_heat = 0.0
+        total_seq = 0.0
+        for _ in range(sim_games_per_layout):
+            sh, _ = simulate_enemy_game_phase(
+                mask,
+                base_heat_phase,
+                disp_counts,
+                "heat",
+                rng,
+                board_size=board_size,
+            )
+            ss, _ = simulate_enemy_game_phase(
+                mask,
+                base_heat_phase,
+                disp_counts,
+                "seq",
+                rng,
+                board_size=board_size,
+            )
+            total_heat += sh
+            total_seq += ss
+        avg_heat = total_heat / sim_games_per_layout if sim_games_per_layout else 0.0
+        avg_seq = total_seq / sim_games_per_layout if sim_games_per_layout else 0.0
+        robust = min(avg_heat, avg_seq)
+        return robust, avg_heat, avg_seq
+
+    cache: Dict[int, Tuple[float, float, float]] = {}
+
+    population: List[Tuple[List[object], int]] = []
+    attempts = 0
+    while len(population) < population_size and attempts < population_size * 8:
+        attempts += 1
+        built = build_random_layout()
+        if built is None:
+            continue
+        genes, mask = built
+        population.append((genes, mask))
+
+    if not population:
+        return None, 0, 0.0, 0.0, 0.0
+
+    best_layout = None
+    best_mask = 0
+    best_robust = -1.0
+    best_heat = 0.0
+    best_seq = 0.0
+
+    for _ in range(max(1, generations)):
+        scored = []
+        for genes, mask in population:
+            if mask not in cache:
+                cache[mask] = eval_mask(mask)
+            robust, avg_heat, avg_seq = cache[mask]
+            scored.append((robust, avg_heat, avg_seq, genes, mask))
+
+        scored.sort(key=lambda s: s[0], reverse=True)
+        if scored and scored[0][0] > best_robust:
+            best_robust, best_heat, best_seq, best_genes, best_mask = scored[0]
+            best_layout = {ship: gene for ship, gene in zip(ship_order, best_genes)}
+
+        elite_n = max(2, int(population_size * elite_frac))
+        elites = scored[:elite_n]
+
+        next_population: List[Tuple[List[object], int]] = [(g, m) for _, _, _, g, m in elites]
+        while len(next_population) < population_size:
+            parent_a = rng.choice(elites)[3]
+            parent_b = rng.choice(elites)[3]
+            child = crossover(parent_a, parent_b)
+            if child is None:
+                continue
+            child = mutate(child[0]) if rng.random() < mutation_rate else child
+            if child is None:
+                continue
+            next_population.append(child)
+
+        population = next_population
 
     return best_layout, best_mask, best_robust, best_heat, best_seq
