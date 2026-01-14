@@ -163,7 +163,8 @@ class DefenseTab(QtWidgets.QWidget):
         right_layout.addWidget(desc)
 
         opponent_row = QtWidgets.QHBoxLayout()
-        opponent_row.addWidget(QtWidgets.QLabel("Opponent:"))
+        self.opponent_label = QtWidgets.QLabel("Opponent:")
+        opponent_row.addWidget(self.opponent_label)
         self.opponent_combo = QtWidgets.QComboBox()
         self.opponent_combo.currentIndexChanged.connect(self._on_opponent_changed)
         opponent_row.addWidget(self.opponent_combo, stretch=1)
@@ -487,6 +488,17 @@ class DefenseTab(QtWidgets.QWidget):
                     break
         self.opponent_combo.blockSignals(False)
 
+    def set_opponent_controls_visible(self, visible: bool) -> None:
+        for widget in (
+            getattr(self, "opponent_label", None),
+            getattr(self, "opponent_combo", None),
+            getattr(self, "opponent_add_btn", None),
+            getattr(self, "opponent_rename_btn", None),
+            getattr(self, "opponent_delete_btn", None),
+        ):
+            if widget is not None:
+                widget.setVisible(bool(visible))
+
     def _ensure_opponents(self) -> None:
         if not self.opponents:
             oid = f"opp_{uuid.uuid4().hex[:8]}"
@@ -495,6 +507,18 @@ class DefenseTab(QtWidgets.QWidget):
         if self.active_opponent_id not in self.opponents:
             self.active_opponent_id = next(iter(self.opponents))
         self._refresh_opponent_combo(self.active_opponent_id)
+
+    def _find_opponent_id_by_name(self, name: str) -> Optional[str]:
+        target = str(name or "").strip().lower()
+        if not target:
+            return None
+        for oid, profile in self.opponents.items():
+            if not isinstance(profile, dict):
+                continue
+            pname = str(profile.get("name") or "").strip().lower()
+            if pname == target:
+                return oid
+        return None
 
     def _save_current_profile(self) -> None:
         if not self.active_opponent_id:
@@ -598,6 +622,39 @@ class DefenseTab(QtWidgets.QWidget):
             if pname:
                 names.append(pname)
         return names
+
+    def opponent_count(self) -> int:
+        return len(self.opponents)
+
+    def rename_active_opponent(self, name: str) -> str:
+        if not self.active_opponent_id:
+            return self._current_opponent_name()
+        clean = str(name).strip() or self._current_opponent_name()
+        profile = self.opponents.get(self.active_opponent_id, {})
+        if isinstance(profile, dict):
+            profile["name"] = clean
+            self.opponents[self.active_opponent_id] = profile
+        self._refresh_opponent_combo(self.active_opponent_id)
+        self.save_state()
+        return clean
+
+    def delete_opponent_by_name(self, name: str) -> bool:
+        if len(self.opponents) <= 1:
+            return False
+        oid = self._find_opponent_id_by_name(name)
+        if not oid:
+            return False
+        del self.opponents[oid]
+        if not self.opponents:
+            return False
+        if self.active_opponent_id == oid:
+            self.active_opponent_id = next(iter(self.opponents))
+        self._refresh_opponent_combo(self.active_opponent_id)
+        profile = self.opponents.get(self.active_opponent_id)
+        if isinstance(profile, dict):
+            self._import_profile(profile)
+        self.save_state()
+        return True
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "board_container", None) and event.type() == QtCore.QEvent.Resize:

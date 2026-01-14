@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -171,6 +172,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.match_opponent_combo = QtWidgets.QComboBox()
         self.match_opponent_combo.setMinimumWidth(220)
         self.match_opponent_combo.currentIndexChanged.connect(self._on_match_opponent_changed)
+        self.match_add_btn = QtWidgets.QPushButton("Add")
+        self.match_add_btn.clicked.connect(self._add_match_opponent)
+        self.match_rename_btn = QtWidgets.QPushButton("Rename")
+        self.match_rename_btn.clicked.connect(self._rename_match_opponent)
+        self.match_delete_btn = QtWidgets.QPushButton("Delete")
+        self.match_delete_btn.clicked.connect(self._delete_match_opponent)
 
         self.match_record_label = QtWidgets.QLabel("Record: 0-0")
         self.match_record_label.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
@@ -190,11 +197,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         match_layout.addWidget(opponent_label, 0, 0)
         match_layout.addWidget(self.match_opponent_combo, 0, 1, 1, 2)
-        match_layout.addWidget(self.match_record_label, 0, 3)
+        match_layout.addWidget(self.match_add_btn, 0, 3)
+        match_layout.addWidget(self.match_rename_btn, 0, 4)
+        match_layout.addWidget(self.match_delete_btn, 0, 5)
+        match_layout.addWidget(self.match_record_label, 0, 6)
 
         match_layout.addWidget(self.match_win_label, 1, 0, 1, 2)
-        match_layout.addWidget(self.match_shots_label, 1, 2)
-        match_layout.addWidget(self.match_turn_label, 1, 3)
+        match_layout.addWidget(self.match_shots_label, 1, 2, 1, 2)
+        match_layout.addWidget(self.match_turn_label, 1, 4, 1, 2)
 
         btn_layout = QtWidgets.QHBoxLayout()
         btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -203,7 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(self.match_record_win_btn)
         btn_layout.addWidget(self.match_record_loss_btn)
         btn_layout.addStretch(1)
-        match_layout.addLayout(btn_layout, 0, 4, 2, 1)
+        match_layout.addLayout(btn_layout, 0, 7, 2, 1)
 
         root_layout.addWidget(self.match_group)
 
@@ -213,6 +223,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.attack_tab.state_updated.connect(self._update_match_status)
         self.defense_tab.state_updated.connect(self._update_match_status)
         self.attack_tab.game_result.connect(self._on_attack_game_result)
+
+        self.attack_tab.set_opponent_controls_visible(False)
+        self.defense_tab.set_opponent_controls_visible(False)
 
         self._refresh_match_opponents()
         active = self.match_state.get("active_opponent") if isinstance(self.match_state, dict) else None
@@ -284,6 +297,81 @@ class MainWindow(QtWidgets.QMainWindow):
         if not name:
             return
         self._set_active_match_opponent(name, persist=True)
+        self._update_match_status()
+
+    def _find_record_key(self, records: dict, name: str) -> Optional[str]:
+        target = str(name or "").strip().lower()
+        if not target:
+            return None
+        for key in records.keys():
+            if isinstance(key, str) and key.strip().lower() == target:
+                return key
+        return None
+
+    def _add_match_opponent(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add Opponent", "Opponent name:")
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name:
+            return
+        self._set_active_match_opponent(name, persist=True)
+        self._update_match_status()
+
+    def _rename_match_opponent(self) -> None:
+        current = self.match_opponent_combo.currentText().strip() or "Opponent"
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename Opponent", "Opponent name:", text=current)
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name:
+            return
+        new_name = self.attack_tab.rename_active_opponent(name)
+        self.defense_tab.rename_active_opponent(new_name)
+
+        records = self.match_state.setdefault("records", {})
+        old_key = self._find_record_key(records, current)
+        new_key = self._find_record_key(records, new_name)
+        if old_key:
+            record = records.pop(old_key)
+            if new_key and new_key != old_key:
+                existing = records.get(new_key, {"wins": 0, "losses": 0})
+                records[new_key] = {
+                    "wins": int(existing.get("wins", 0)) + int(record.get("wins", 0)),
+                    "losses": int(existing.get("losses", 0)) + int(record.get("losses", 0)),
+                }
+            else:
+                records[new_name] = record
+        self.match_state["records"] = records
+        self.match_state["active_opponent"] = new_name
+        save_match_state(self.APP_STATE_PATH, self.match_state)
+        self._refresh_match_opponents()
+        self._update_match_status()
+
+    def _delete_match_opponent(self) -> None:
+        name = self.match_opponent_combo.currentText().strip() or "Opponent"
+        if self.attack_tab.opponent_count() <= 1 or self.defense_tab.opponent_count() <= 1:
+            QtWidgets.QMessageBox.information(self, "Cannot delete", "At least one opponent profile is required.")
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Opponent",
+            f"Delete opponent profile '{name}'?\nThis cannot be undone.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        self.attack_tab.delete_opponent_by_name(name)
+        self.defense_tab.delete_opponent_by_name(name)
+
+        records = self.match_state.setdefault("records", {})
+        key = self._find_record_key(records, name)
+        if key:
+            records.pop(key, None)
+        self.match_state["records"] = records
+        new_active = self.attack_tab._current_opponent_name()
+        self._set_active_match_opponent(new_active, persist=True)
         self._update_match_status()
 
     def _record_match_result(self, win: bool) -> None:
