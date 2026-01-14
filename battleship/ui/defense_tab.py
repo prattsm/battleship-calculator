@@ -60,6 +60,7 @@ class DefenseTab(QtWidgets.QWidget):
         self.eval_results: Dict[str, object] = {}
         self._eval_worker: Optional["DefenseEvalWorker"] = None
         self._eval_progress: Optional[QtWidgets.QProgressDialog] = None
+        self.heatmap_checkbox: Optional[QtWidgets.QCheckBox] = None
 
         self._build_ui()
         self.load_state()
@@ -768,7 +769,7 @@ class DefenseTab(QtWidgets.QWidget):
         )
 
     def update_board_view(self):
-        show_heat = self.heatmap_checkbox.isChecked()
+        show_heat = bool(self.heatmap_checkbox.isChecked()) if self.heatmap_checkbox is not None else False
 
         # First pass: max total count for normalization
         max_count = 0.0
