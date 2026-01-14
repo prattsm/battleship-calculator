@@ -71,6 +71,13 @@ def _compute_phase_avg(stats: Dict[str, object], phase: str) -> Optional[float]:
     return total / games
 
 
+def _set_tooltip_palette(app: QtWidgets.QApplication) -> None:
+    palette = app.palette()
+    palette.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor(Theme.BG_PANEL))
+    palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor(Theme.TEXT_MAIN))
+    app.setPalette(palette)
+
+
 class ModelStatsTab(QtWidgets.QWidget):
     STATE_PATH = "battleship_model_stats.json"
 
@@ -99,6 +106,12 @@ class ModelStatsTab(QtWidgets.QWidget):
         self.load_state()
         self.refresh_table()
         self.update_summary_label()
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                _set_tooltip_palette(app)
+        except Exception:
+            pass
 
     # ---------------- UI ----------------
 
@@ -2649,14 +2662,17 @@ class StatsGraphWidget(QtWidgets.QWidget):
 
         pos = event.pos()
         hovered = None
+        in_draw_rect = False
         for i, rect in enumerate(self._bar_hit_rects):
             if rect.contains(pos):
-                hovered = i
+                if 0 <= i < len(self.hist) and self.hist[i] > 0:
+                    hovered = i
+                    in_draw_rect = True
                 break
 
         if hovered != self._hover_idx:
             self._hover_idx = hovered
-            if hovered is not None and 0 <= hovered < len(self.hist):
+            if hovered is not None and in_draw_rect and 0 <= hovered < len(self.hist):
                 count = int(self.hist[hovered])
                 total = max(1, sum(self.hist))
                 pct = 100.0 * (count / total)

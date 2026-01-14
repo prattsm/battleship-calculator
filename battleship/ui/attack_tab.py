@@ -75,14 +75,15 @@ class AttackTab(QtWidgets.QWidget):
         # Model selection state
         self.model_defs = model_defs()
         self.attack_model_defs = list(self.model_defs)
-        self.attack_model_defs.append(
-            {
-                "key": "two_ply",
-                "name": "Two-ply (Legacy)",
-                "description": "Two-ply information heuristic (legacy Attack tab behavior).",
-                "notes": "Uses a 2-step information criterion; keeps the prior UI feel when no stats are available.",
-            }
-        )
+        if not any(md.get("key") == "two_ply" for md in self.attack_model_defs):
+            self.attack_model_defs.append(
+                {
+                    "key": "two_ply",
+                    "name": "Two-ply (Legacy)",
+                    "description": "Two-ply information heuristic (legacy Attack tab behavior).",
+                    "notes": "Uses a 2-step information criterion; keeps the prior UI feel when no stats are available.",
+                }
+            )
         self.auto_mode = self.AUTO_MODE_PHASE
         self.manual_model_key = "two_ply"
         self.lock_model_for_game = False
@@ -156,9 +157,10 @@ class AttackTab(QtWidgets.QWidget):
         left_layout.addLayout(overlay_layout)
 
         board_container = QtWidgets.QWidget()
+        board_container.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         board_layout = QtWidgets.QGridLayout(board_container)
         board_layout.setSpacing(2)
-        board_layout.setContentsMargins(16, 16, 16, 16)
+        board_layout.setContentsMargins(8, 8, 8, 8)
 
         for c in range(self.board_size):
             lbl = QtWidgets.QLabel(chr(ord("A") + c))
@@ -184,7 +186,13 @@ class AttackTab(QtWidgets.QWidget):
                 board_layout.addWidget(btn, r + 1, c + 1)
             self.cell_buttons.append(row)
 
+        grid_size = (self.board_size + 1) * (cell_size + board_layout.spacing())
+        board_container.setFixedSize(grid_size, grid_size)
+
         board_scroll = wrap_scroll(board_container)
+        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         left_layout.addWidget(board_scroll, stretch=1)
 
         quick_group = QtWidgets.QGroupBox("Quick actions")

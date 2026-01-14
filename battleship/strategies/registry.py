@@ -94,4 +94,10 @@ def model_defs() -> List[Dict[str, object]]:
             "description": "Samples one consistent world and plays as if it is true (then resamples next turn).",
             "notes": "Naturally balances exploration/exploitation. Often very strong without explicit hunt/target heuristics.",
         },
+        {
+            "key": "two_ply",
+            "name": "Two-ply (Legacy)",
+            "description": "Two-step information heuristic used by the original Attack tab.",
+            "notes": "Included for comparison and backward compatibility.",
+        },
     ]

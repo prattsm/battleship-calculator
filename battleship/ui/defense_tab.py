@@ -89,9 +89,10 @@ class DefenseTab(QtWidgets.QWidget):
         main_layout.addWidget(splitter, stretch=1)
 
         board_container = QtWidgets.QWidget()
+        board_container.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         board_layout = QtWidgets.QGridLayout(board_container)
         board_layout.setSpacing(2)
-        board_layout.setContentsMargins(16, 16, 16, 16)
+        board_layout.setContentsMargins(8, 8, 8, 8)
 
         for c in range(self.board_size):
             lbl = QtWidgets.QLabel(chr(ord("A") + c))
@@ -117,7 +118,14 @@ class DefenseTab(QtWidgets.QWidget):
                 board_layout.addWidget(btn, r + 1, c + 1)
             self.cell_buttons_def.append(row)
 
-        splitter.addWidget(wrap_scroll(board_container))
+        grid_size = (self.board_size + 1) * (cell_size + board_layout.spacing())
+        board_container.setFixedSize(grid_size, grid_size)
+
+        board_scroll = wrap_scroll(board_container)
+        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        board_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        splitter.addWidget(board_scroll)
 
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
