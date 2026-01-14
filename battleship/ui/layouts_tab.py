@@ -324,18 +324,6 @@ class LayoutsTab(QtWidgets.QWidget):
         btn_row2.addWidget(self.delete_btn)
         left_layout.addLayout(btn_row2)
 
-        btn_row3 = QtWidgets.QHBoxLayout()
-        self.import_btn = QtWidgets.QPushButton("Import")
-        self.import_btn.clicked.connect(self.import_layouts)
-        btn_row3.addWidget(self.import_btn)
-        self.export_btn = QtWidgets.QPushButton("Export selected")
-        self.export_btn.clicked.connect(self.export_selected_layout)
-        btn_row3.addWidget(self.export_btn)
-        self.export_all_btn = QtWidgets.QPushButton("Export all")
-        self.export_all_btn.clicked.connect(self.export_all_layouts)
-        btn_row3.addWidget(self.export_all_btn)
-        left_layout.addLayout(btn_row3)
-
         left_panel.setMinimumWidth(240)
         splitter.addWidget(left_panel)
 
@@ -565,100 +553,6 @@ class LayoutsTab(QtWidgets.QWidget):
         self._refresh_layout_list(select_first=True)
         if self.on_layouts_updated:
             self.on_layouts_updated()
-
-    def import_layouts(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Import Layouts",
-            "",
-            "Layouts JSON (*.json);;All Files (*)",
-        )
-        if not path:
-            return
-
-        imported = load_custom_layouts(path)
-        if not imported:
-            QtWidgets.QMessageBox.information(self, "No layouts", "No valid layouts found in file.")
-            return
-
-        valid_layouts: List[LayoutDefinition] = []
-        errors: List[str] = []
-        for layout in imported:
-            errs = self._validate_layout(layout)
-            if errs:
-                errors.append(f"{layout.name}: " + "; ".join(errs))
-            else:
-                valid_layouts.append(layout)
-
-        if errors:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Some layouts skipped",
-                "\n".join(errors),
-            )
-
-        if not valid_layouts:
-            return
-
-        existing_ids = {layout.layout_id for layout in self.custom_layouts}
-        new_layouts: List[LayoutDefinition] = list(self.custom_layouts)
-        new_ids: List[str] = []
-
-        for layout in valid_layouts:
-            layout_id = layout.layout_id
-            if not is_custom_layout_id(layout_id) or layout_id in existing_ids:
-                layout_id = new_custom_layout_id()
-                name = layout.name
-                suffix = " (imported)"
-                layout = LayoutDefinition(
-                    layout_id=layout_id,
-                    name=f"{name}{suffix}",
-                    board_size=layout.board_size,
-                    ships=layout.ships,
-                    allow_touching=layout.allow_touching,
-                    layout_version=layout.layout_version,
-                )
-            existing_ids.add(layout_id)
-            new_layouts.append(layout)
-            new_ids.append(layout.layout_id)
-
-        save_custom_layouts(new_layouts, CUSTOM_LAYOUTS_PATH)
-        self.custom_layouts = new_layouts
-        self._refresh_layout_list(select_id=new_ids[0] if new_ids else None)
-        self.status_label.setText(f"Imported {len(new_ids)} layout(s).")
-        if self.on_layouts_updated:
-            self.on_layouts_updated()
-
-    def export_selected_layout(self):
-        row = self.layout_list.currentRow()
-        if row < 0 or row >= len(self.custom_layouts):
-            return
-        layout = self.custom_layouts[row]
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Export Layout",
-            f"{layout.name}.json",
-            "Layouts JSON (*.json);;All Files (*)",
-        )
-        if not path:
-            return
-        save_custom_layouts([layout], path)
-        self.status_label.setText(f"Exported {layout.name}.")
-
-    def export_all_layouts(self):
-        if not self.custom_layouts:
-            QtWidgets.QMessageBox.information(self, "No layouts", "No custom layouts to export.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Export All Layouts",
-            "custom_layouts.json",
-            "Layouts JSON (*.json);;All Files (*)",
-        )
-        if not path:
-            return
-        save_custom_layouts(self.custom_layouts, path)
-        self.status_label.setText(f"Exported {len(self.custom_layouts)} layout(s).")
 
     def _validate_layout(self, layout: LayoutDefinition) -> List[str]:
         errors = validate_layout(layout)
