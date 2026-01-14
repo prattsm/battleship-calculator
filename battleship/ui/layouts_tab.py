@@ -38,9 +38,10 @@ def _parse_cells(text: str) -> Tuple[Tuple[int, int], ...]:
 
 
 class ShipDialog(QtWidgets.QDialog):
-    def __init__(self, ship: Optional[ShipSpec] = None, parent=None):
+    def __init__(self, ship: Optional[ShipSpec] = None, parent=None, force_shape: bool = False):
         super().__init__(parent)
         self.ship = ship
+        self.force_shape = force_shape
         self._grid_updating = False
         self.grid_size = 6
         self.grid_buttons: List[List[QtWidgets.QToolButton]] = []
@@ -53,25 +54,27 @@ class ShipDialog(QtWidgets.QDialog):
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
 
-        form = QtWidgets.QFormLayout()
+        self.form = QtWidgets.QFormLayout()
         self.id_input = QtWidgets.QLineEdit()
-        form.addRow("Instance ID", self.id_input)
+        self.form.addRow("Instance ID", self.id_input)
 
         self.name_input = QtWidgets.QLineEdit()
-        form.addRow("Display name", self.name_input)
+        self.form.addRow("Display name", self.name_input)
 
         self.kind_combo = QtWidgets.QComboBox()
         self.kind_combo.addItems(["line", "shape"])
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
-        form.addRow("Kind", self.kind_combo)
+        self.lbl_kind = QtWidgets.QLabel("Kind")
+        self.form.addRow(self.lbl_kind, self.kind_combo)
 
         self.length_spin = QtWidgets.QSpinBox()
         self.length_spin.setRange(1, 20)
-        form.addRow("Length", self.length_spin)
+        self.lbl_length = QtWidgets.QLabel("Length")
+        self.form.addRow(self.lbl_length, self.length_spin)
 
         self.cells_edit = QtWidgets.QPlainTextEdit()
         self.cells_edit.setPlaceholderText("Example:\n0,0\n0,1\n1,0")
-        form.addRow("Shape cells", self.cells_edit)
+        self.form.addRow("Shape cells", self.cells_edit)
 
         self.shape_group = QtWidgets.QGroupBox("Shape painter")
         shape_layout = QtWidgets.QVBoxLayout(self.shape_group)
@@ -105,9 +108,9 @@ class ShipDialog(QtWidgets.QDialog):
 
         self.rotate_cb = QtWidgets.QCheckBox("Allow rotations")
         self.rotate_cb.setChecked(True)
-        form.addRow("", self.rotate_cb)
+        self.form.addRow("", self.rotate_cb)
 
-        layout.addLayout(form)
+        layout.addLayout(self.form)
 
         self.error_label = QtWidgets.QLabel("")
         self.error_label.setStyleSheet("color: #ff6b6b;")
@@ -118,6 +121,15 @@ class ShipDialog(QtWidgets.QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+        if self.force_shape:
+            self.kind_combo.setCurrentText("shape")
+            self.kind_combo.setEnabled(False)
+            self.lbl_kind.setVisible(False)
+            self.kind_combo.setVisible(False)
+            self.length_spin.setEnabled(False)
+            self.length_spin.setVisible(False)
+            self.lbl_length.setVisible(False)
 
         self._on_kind_changed()
         self._build_shape_grid(self.grid_size)
@@ -131,11 +143,17 @@ class ShipDialog(QtWidgets.QDialog):
     def _load_ship(self, ship: ShipSpec):
         self.id_input.setText(ship.instance_id)
         self.name_input.setText(ship.name or "")
-        self.kind_combo.setCurrentText(ship.kind)
-        self.length_spin.setValue(int(ship.length or 1))
-        if ship.cells:
-            cells = "\n".join(f"{r},{c}" for r, c in ship.cells)
+        if self.force_shape and ship.kind == "line":
+            length = int(ship.length or 1)
+            cells = "\n".join(f"0,{c}" for c in range(max(1, length)))
             self.cells_edit.setPlainText(cells)
+            self.kind_combo.setCurrentText("shape")
+        else:
+            self.kind_combo.setCurrentText(ship.kind)
+            self.length_spin.setValue(int(ship.length or 1))
+            if ship.cells:
+                cells = "\n".join(f"{r},{c}" for r, c in ship.cells)
+                self.cells_edit.setPlainText(cells)
         self.rotate_cb.setChecked(bool(ship.allow_rotations))
         self._on_kind_changed()
         if ship.kind == "shape":
@@ -365,14 +383,10 @@ class LayoutsTab(QtWidgets.QWidget):
         ship_layout.addWidget(self.ship_table)
 
         ship_btns = QtWidgets.QHBoxLayout()
-        self.add_line_btn = QtWidgets.QPushButton("Add line")
-        self.add_line_btn.clicked.connect(lambda: self._add_ship("line"))
-        self.add_line_btn.setToolTip("Add a straight ship (horizontal/vertical) of a chosen length.")
-        ship_btns.addWidget(self.add_line_btn)
-        self.add_shape_btn = QtWidgets.QPushButton("Add shape")
-        self.add_shape_btn.clicked.connect(lambda: self._add_ship("shape"))
-        self.add_shape_btn.setToolTip("Draw a custom ship by selecting cells in the shape painter.")
-        ship_btns.addWidget(self.add_shape_btn)
+        self.add_ship_btn = QtWidgets.QPushButton("Add ship")
+        self.add_ship_btn.clicked.connect(self._add_ship)
+        self.add_ship_btn.setToolTip("Add a ship by clicking cells in the shape painter.")
+        ship_btns.addWidget(self.add_ship_btn)
         self.edit_ship_btn = QtWidgets.QPushButton("Edit")
         self.edit_ship_btn.clicked.connect(self._edit_ship)
         ship_btns.addWidget(self.edit_ship_btn)
@@ -380,7 +394,7 @@ class LayoutsTab(QtWidgets.QWidget):
         self.remove_ship_btn.clicked.connect(self._remove_ship)
         ship_btns.addWidget(self.remove_ship_btn)
         ship_layout.addLayout(ship_btns)
-        ship_hint = QtWidgets.QLabel("Add line = straight ship. Add shape = custom cells.")
+        ship_hint = QtWidgets.QLabel("Click cells in the painter to define the ship shape.")
         ship_hint.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
         ship_layout.addWidget(ship_hint)
         right_layout.addWidget(ship_group)
@@ -414,8 +428,9 @@ class LayoutsTab(QtWidgets.QWidget):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
 
-    def _refresh_layout_list(self, select_first: bool = False, select_id: Optional[str] = None):
-        self.custom_layouts = load_custom_layouts(CUSTOM_LAYOUTS_PATH)
+    def _refresh_layout_list(self, select_first: bool = False, select_id: Optional[str] = None, reload: bool = True):
+        if reload:
+            self.custom_layouts = load_custom_layouts(CUSTOM_LAYOUTS_PATH)
         self.layout_list.blockSignals(True)
         self.layout_list.clear()
         for layout in self.custom_layouts:
@@ -434,6 +449,30 @@ class LayoutsTab(QtWidgets.QWidget):
             self.current_layout_id = None
             self.ship_specs = []
             self._clear_editor()
+
+    def _add_layout_to_list(self, layout: LayoutDefinition) -> int:
+        label = f"{layout.name} ({layout.board_size}x{layout.board_size})"
+        self.layout_list.addItem(label)
+        return self.layout_list.count() - 1
+
+    def _update_current_list_label(self, name_override: Optional[str] = None) -> None:
+        if not self.current_layout_id:
+            return
+        idx = None
+        for i, layout in enumerate(self.custom_layouts):
+            if layout.layout_id == self.current_layout_id:
+                idx = i
+                break
+        if idx is None:
+            return
+        name = name_override if name_override is not None else self.custom_layouts[idx].name
+        if not name:
+            name = "New layout"
+        board_size = int(self.board_spin.value())
+        label = f"{name} ({board_size}x{board_size})"
+        item = self.layout_list.item(idx)
+        if item is not None:
+            item.setText(label)
 
     def _clear_editor(self):
         self.name_input.setText("")
@@ -455,14 +494,16 @@ class LayoutsTab(QtWidgets.QWidget):
         self.board_spin.setEnabled(can_edit)
         self.touch_cb.setEnabled(can_edit)
         self.ship_table.setEnabled(can_edit)
-        self.add_line_btn.setEnabled(can_edit)
-        self.add_shape_btn.setEnabled(can_edit)
+        self.add_ship_btn.setEnabled(can_edit)
         self.edit_ship_btn.setEnabled(can_edit)
         self.remove_ship_btn.setEnabled(can_edit)
         self.save_btn.setEnabled(can_edit)
         self.activate_btn.setEnabled(can_edit)
         if self._edit_mode and not can_edit:
             self.status_label.setText("Enter a layout name to unlock editing.")
+        if self._edit_mode:
+            name = str(text).strip() if str(text).strip() else "New layout"
+            self._update_current_list_label(name_override=name)
 
     def _refresh_ship_table(self):
         self.ship_table.setRowCount(len(self.ship_specs))
@@ -500,6 +541,8 @@ class LayoutsTab(QtWidgets.QWidget):
         self.summary_label.setText(
             f"Ships: {len(self.ship_specs)} | Ship cells: {total_cells}/{area}{note} | Touching: {touching}"
         )
+        if self._edit_mode:
+            self._update_current_list_label()
 
     def _on_layout_selected(self, row: int):
         if row < 0 or row >= len(self.custom_layouts):
@@ -515,10 +558,8 @@ class LayoutsTab(QtWidgets.QWidget):
         self.status_label.setText(f"Viewing {layout.name} (v{layout.layout_version}). Click New to edit.")
         self._set_edit_enabled(False)
 
-    def _add_ship(self, kind: str):
-        dialog = ShipDialog(parent=self)
-        dialog.kind_combo.setCurrentText(kind)
-        dialog._on_kind_changed()
+    def _add_ship(self):
+        dialog = ShipDialog(parent=self, force_shape=True)
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.ship is not None:
             self.ship_specs.append(dialog.ship)
             self._refresh_ship_table()
@@ -527,7 +568,7 @@ class LayoutsTab(QtWidgets.QWidget):
         row = self.ship_table.currentRow()
         if row < 0 or row >= len(self.ship_specs):
             return
-        dialog = ShipDialog(self.ship_specs[row], parent=self)
+        dialog = ShipDialog(self.ship_specs[row], parent=self, force_shape=True)
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.ship is not None:
             self.ship_specs[row] = dialog.ship
             self._refresh_ship_table()
@@ -540,9 +581,28 @@ class LayoutsTab(QtWidgets.QWidget):
         self._refresh_ship_table()
 
     def new_layout(self):
-        self.current_layout_id = None
         self.ship_specs = []
-        self._clear_editor()
+        layout_id = new_custom_layout_id()
+        draft = LayoutDefinition(
+            layout_id=layout_id,
+            name="New layout",
+            board_size=10,
+            ships=tuple(),
+            allow_touching=True,
+            layout_version=1,
+        )
+        self.custom_layouts.append(draft)
+        self.current_layout_id = layout_id
+        self.layout_list.blockSignals(True)
+        idx = self._add_layout_to_list(draft)
+        self.layout_list.setCurrentRow(idx)
+        self.layout_list.blockSignals(False)
+        self.name_input.setText("")
+        self.board_spin.setValue(draft.board_size)
+        self.touch_cb.setChecked(draft.allow_touching)
+        self.ship_specs = []
+        self._refresh_ship_table()
+        self._update_layout_summary()
         self._set_edit_enabled(True)
         self.status_label.setText("Name the layout to unlock editing.")
 
@@ -551,11 +611,25 @@ class LayoutsTab(QtWidgets.QWidget):
         if row < 0 or row >= len(self.custom_layouts):
             return
         layout = self.custom_layouts[row]
-        self.current_layout_id = None
-        self.name_input.setText(f"{layout.name} Copy")
-        self.board_spin.setValue(layout.board_size)
-        self.touch_cb.setChecked(layout.allow_touching)
-        self.ship_specs = list(layout.ships)
+        layout_id = new_custom_layout_id()
+        draft = LayoutDefinition(
+            layout_id=layout_id,
+            name=f"{layout.name} Copy",
+            board_size=layout.board_size,
+            ships=layout.ships,
+            allow_touching=layout.allow_touching,
+            layout_version=1,
+        )
+        self.custom_layouts.append(draft)
+        self.current_layout_id = layout_id
+        self.layout_list.blockSignals(True)
+        idx = self._add_layout_to_list(draft)
+        self.layout_list.setCurrentRow(idx)
+        self.layout_list.blockSignals(False)
+        self.name_input.setText(draft.name)
+        self.board_spin.setValue(draft.board_size)
+        self.touch_cb.setChecked(draft.allow_touching)
+        self.ship_specs = list(draft.ships)
         self._refresh_ship_table()
         self._set_edit_enabled(True)
         self.status_label.setText("Duplicated layout. Save to create a new custom layout.")
@@ -564,11 +638,25 @@ class LayoutsTab(QtWidgets.QWidget):
         active = self.get_active_layout() if self.get_active_layout else None
         if active is None:
             return
-        self.current_layout_id = None
-        self.name_input.setText(f"{active.name} Custom")
-        self.board_spin.setValue(active.board_size)
-        self.touch_cb.setChecked(active.allow_touching)
-        self.ship_specs = list(active.ships)
+        layout_id = new_custom_layout_id()
+        draft = LayoutDefinition(
+            layout_id=layout_id,
+            name=f"{active.name} Custom",
+            board_size=active.board_size,
+            ships=active.ships,
+            allow_touching=active.allow_touching,
+            layout_version=1,
+        )
+        self.custom_layouts.append(draft)
+        self.current_layout_id = layout_id
+        self.layout_list.blockSignals(True)
+        idx = self._add_layout_to_list(draft)
+        self.layout_list.setCurrentRow(idx)
+        self.layout_list.blockSignals(False)
+        self.name_input.setText(draft.name)
+        self.board_spin.setValue(draft.board_size)
+        self.touch_cb.setChecked(draft.allow_touching)
+        self.ship_specs = list(draft.ships)
         self._refresh_ship_table()
         self._set_edit_enabled(True)
         self.status_label.setText("Copied active layout. Save to create a new custom layout.")
@@ -601,6 +689,11 @@ class LayoutsTab(QtWidgets.QWidget):
             placements = generate_ship_placements(spec, layout.board_size, layout.allow_touching)
             if not placements:
                 errors.append(f"Ship {spec.instance_id} has no valid placements.")
+            if spec.kind == "shape" and spec.cells:
+                max_r = max(r for r, _ in spec.cells)
+                max_c = max(c for _, c in spec.cells)
+                if max_r >= layout.board_size or max_c >= layout.board_size:
+                    errors.append(f"Ship {spec.instance_id} does not fit within the board size.")
         total_cells = sum(
             int(spec.length or 0) if spec.kind == "line" else len(spec.cells or [])
             for spec in layout.ships
@@ -667,7 +760,7 @@ class LayoutsTab(QtWidgets.QWidget):
         save_custom_layouts(new_layouts, CUSTOM_LAYOUTS_PATH)
         self.current_layout_id = candidate.layout_id
         self.custom_layouts = new_layouts
-        self._refresh_layout_list(select_id=candidate.layout_id)
+        self._refresh_layout_list(select_id=candidate.layout_id, reload=True)
         if version_bumped:
             self.status_label.setText(
                 f"Saved layout {candidate.name} (v{candidate.layout_version}). Previous stats are now stale."
