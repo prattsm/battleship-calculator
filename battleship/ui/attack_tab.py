@@ -1225,6 +1225,19 @@ class AttackTab(QtWidgets.QWidget):
             note = f"Stochastic: softmax T={temp:.2f}"
             return candidates, score_label, higher_better, note
 
+        if model_key == "ucb_explore":
+            score_label = "UCB"
+            c_bonus = 0.35
+            specs = PARAM_SPECS.get("ucb_explore", [])
+            if specs:
+                c_bonus = float(specs[0].get("default", c_bonus))
+            for r, c in unknown_cells:
+                p = p_hit(r, c)
+                bonus = c_bonus * math.sqrt(max(0.0, p * (1.0 - p)))
+                candidates.append({"cell": (r, c), "p_hit": p, "score": p + bonus})
+            note = f"Exploration bonus c={c_bonus:.2f}"
+            return candidates, score_label, higher_better, note
+
         if model_key == "parity_greedy":
             score_label = "p(hit)"
             evens = [(r, c) for (r, c) in unknown_cells if (r + c) % 2 == 0]
@@ -1411,11 +1424,27 @@ class AttackTab(QtWidgets.QWidget):
                 for r, c in unknown_cells:
                     if (chosen >> cell_index(r, c, self.board_size)) & 1:
                         candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": 1.0})
-                note = "Sampled one world"
+            note = "Sampled one world"
             if not candidates:
                 for r, c in unknown_cells:
                     candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": 1.0})
                 note = "Fallback: uniform"
+            return candidates, score_label, higher_better, note
+
+        if model_key == "rollout_mcts":
+            score_label = "Base"
+            if is_target_mode:
+                for r, c in unknown_cells:
+                    candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": p_hit(r, c)})
+                note = "Rollout lookahead (target mode baseline)"
+            else:
+                for r, c in unknown_cells:
+                    idx = cell_index(r, c, self.board_size)
+                    n_hit = self.cell_hit_counts[idx]
+                    n_miss = N - n_hit
+                    score = N - (n_hit * n_hit + n_miss * n_miss) / N
+                    candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": score})
+                note = "Rollout lookahead (hunt mode baseline)"
             return candidates, score_label, higher_better, note
 
         # Default: greedy-like probability
@@ -2034,7 +2063,8 @@ class AttackTab(QtWidgets.QWidget):
                 self.best_prob = 0.0
 
         rollout_note = ""
-        if self.rollout_enabled and not self.game_over and N > 0 and candidates:
+        rollout_active = self.rollout_enabled or model_key == "rollout_mcts"
+        if rollout_active and not self.game_over and N > 0 and candidates:
             budget = self._rollout_budget(len(unknown_cells))
             if not budget.get("enabled", False):
                 rollout_note = str(budget.get("note", "")).strip()
@@ -2057,6 +2087,17 @@ class AttackTab(QtWidgets.QWidget):
                         rollout_note += " (throttled)"
                 else:
                     rollout_note = str(budget.get("note", "")).strip()
+            if model_key == "rollout_mcts" and not self.rollout_enabled:
+                if budget.get("enabled", False):
+                    if rollout_note:
+                        rollout_note += " (model forces lookahead)"
+                    else:
+                        rollout_note = "Lookahead active (model forces lookahead)."
+                else:
+                    if rollout_note:
+                        rollout_note += " (model throttled)"
+                    else:
+                        rollout_note = "Lookahead throttled (model selected)."
 
         warnings = self._compute_warnings()
         self.warning_label.setText(warnings)

@@ -39,4 +39,16 @@ PARAM_SPECS = {
         {"key": "w_neighbor", "label": "Cluster Bonus", "default": 0.20, "min": 0.00, "max": 2.00, "step": 0.05},
         {"key": "w_endpoint", "label": "Endpoint Bonus", "default": 0.40, "min": 0.00, "max": 2.00, "step": 0.05},
     ],
+
+    # UCB-style exploration bonus coefficient.
+    "ucb_explore": [
+        {"key": "ucb_c", "label": "Explore Bonus (c)", "default": 0.35, "min": 0.00, "max": 1.00, "step": 0.05}
+    ],
+
+    # Rollout model parameters (kept small for practical simulation speed).
+    "rollout_mcts": [
+        {"key": "rollouts", "label": "Rollouts", "default": 6, "min": 2, "max": 30, "step": 2, "is_int": True},
+        {"key": "top_k", "label": "Top Cells", "default": 5, "min": 2, "max": 12, "step": 1, "is_int": True},
+        {"key": "max_shots", "label": "Max Sim Shots", "default": 64, "min": 12, "max": 128, "step": 4, "is_int": True},
+    ],
 }

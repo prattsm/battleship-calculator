@@ -3,7 +3,7 @@ import random
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from battleship.domain.board import cell_index
-from battleship.domain.config import BOARD_SIZE, EMPTY, HIT
+from battleship.domain.config import BOARD_SIZE, EMPTY, HIT, MISS
 from battleship.domain.worlds import compute_min_expected_worlds_after_one_shot, sample_worlds
 
 
@@ -292,9 +292,113 @@ def _choose_next_shot_for_strategy(
                     best_mass = mass
                     best_cells = cells
 
-            if best_cells:
-                return max(best_cells, key=lambda rc: cell_probs[cell_index(rc[0], rc[1], board_size)])
-            return rng.choice(unknown_cells)
+        if best_cells:
+            return max(best_cells, key=lambda rc: cell_probs[cell_index(rc[0], rc[1], board_size)])
+        return rng.choice(unknown_cells)
+
+    if strategy == "rollout_mcts":
+        rollouts = max(2, int(params.get("rollouts", 6)))
+        top_k = max(2, int(params.get("top_k", 5)))
+        max_shots = int(params.get("max_shots", board_size * board_size))
+
+        def info_gain(idx: int) -> float:
+            n_hit = cell_hit_counts[idx]
+            n_miss = N - n_hit
+            return N - (n_hit * n_hit + n_miss * n_miss) / N
+
+        if is_target_mode:
+            ranked = sorted(
+                unknown_cells,
+                key=lambda rc: cell_probs[cell_index(rc[0], rc[1], board_size)],
+                reverse=True,
+            )
+        else:
+            ranked = sorted(
+                unknown_cells,
+                key=lambda rc: info_gain(cell_index(rc[0], rc[1], board_size)),
+                reverse=True,
+            )
+        eval_cells = ranked[: min(top_k, len(ranked))]
+
+        if not eval_cells or not worlds_union:
+            strategy = "greedy"
+        else:
+            world_samples = worlds_union if len(worlds_union) <= rollouts else rng.sample(worlds_union, rollouts)
+
+            def neighbours4(rr: int, cc: int):
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < board_size and 0 <= nc < board_size:
+                        yield nr, nc
+
+            def rollout_policy(sim_board: List[List[str]]) -> Tuple[int, int]:
+                frontier = []
+                for rr in range(board_size):
+                    for cc in range(board_size):
+                        if sim_board[rr][cc] != HIT:
+                            continue
+                        for nr, nc in neighbours4(rr, cc):
+                            if sim_board[nr][nc] == EMPTY:
+                                frontier.append((nr, nc))
+                if frontier:
+                    return rng.choice(frontier)
+                parity = [(rr, cc) for rr in range(board_size) for cc in range(board_size)
+                          if sim_board[rr][cc] == EMPTY and (rr + cc) % 2 == 0]
+                if parity:
+                    return rng.choice(parity)
+                remaining = [(rr, cc) for rr in range(board_size) for cc in range(board_size)
+                             if sim_board[rr][cc] == EMPTY]
+                return rng.choice(remaining) if remaining else (0, 0)
+
+            def simulate_rollout(first_cell: Tuple[int, int], world_mask: int) -> int:
+                sim_board = [row[:] for row in board]
+                total_targets = int(bin(world_mask).count("1"))
+                hits = 0
+                for rr in range(board_size):
+                    for cc in range(board_size):
+                        if sim_board[rr][cc] == HIT:
+                            idx = cell_index(rr, cc, board_size)
+                            if (world_mask >> idx) & 1:
+                                hits += 1
+                remaining = max(0, total_targets - hits)
+
+                shots = 0
+                fr, fc = first_cell
+                if sim_board[fr][fc] == EMPTY:
+                    idx = cell_index(fr, fc, board_size)
+                    is_hit = (world_mask >> idx) & 1
+                    sim_board[fr][fc] = HIT if is_hit else MISS
+                    shots += 1
+                    if is_hit:
+                        remaining -= 1
+
+                while remaining > 0 and shots < max_shots:
+                    r2, c2 = rollout_policy(sim_board)
+                    if sim_board[r2][c2] != EMPTY:
+                        break
+                    idx2 = cell_index(r2, c2, board_size)
+                    is_hit = (world_mask >> idx2) & 1
+                    sim_board[r2][c2] = HIT if is_hit else MISS
+                    shots += 1
+                    if is_hit:
+                        remaining -= 1
+                if remaining > 0 and shots >= max_shots:
+                    shots += remaining
+                return shots
+
+            best_cell = None
+            best_avg = None
+            for cell in eval_cells:
+                total = 0.0
+                for wmask in world_samples:
+                    total += simulate_rollout(cell, wmask)
+                avg = total / len(world_samples)
+                if best_avg is None or avg < best_avg:
+                    best_avg = avg
+                    best_cell = cell
+            if best_cell is not None:
+                return best_cell
+            strategy = "greedy"
 
     if strategy == "softmax_greedy":
         if is_target_mode:
@@ -396,6 +500,13 @@ def _choose_next_shot_for_strategy(
         dist2 = (r - center) ** 2 + (c - center) ** 2
         return cell_probs[cell_index(r, c, board_size)] / (1.0 + 0.25 * dist2)
 
+    def score_ucb_explore(r: int, c: int) -> float:
+        idx = cell_index(r, c, board_size)
+        p = cell_probs[idx]
+        c_bonus = float(params.get("ucb_c", 0.35))
+        bonus = c_bonus * math.sqrt(max(0.0, p * (1.0 - p)))
+        return p + bonus
+
     prefer_even = False
     if strategy == "parity_greedy":
         evens = [(rr, cc) for (rr, cc) in unknown_cells if (rr + cc) % 2 == 0]
@@ -417,6 +528,7 @@ def _choose_next_shot_for_strategy(
         "parity_greedy": score_parity_greedy,
         "center_weighted": score_center_weighted,
         "adaptive_skew": score_adaptive_skew,
+        "ucb_explore": score_ucb_explore,
     }
     scorer = scorers.get(strategy, score_greedy)
 
