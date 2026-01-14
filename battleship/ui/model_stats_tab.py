@@ -1953,32 +1953,6 @@ class ModelDetailDialog(QtWidgets.QDialog):
     def _build_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
 
-        # Header
-        title = QtWidgets.QLabel(self.model_def.get("name", self.model_def.get("key", "Model")))
-        f = title.font()
-        f.setPointSize(16)
-        f.setBold(True)
-        title.setFont(f)
-        main_layout.addWidget(title)
-
-        # Notes / Description + personal overrides
-        notes_label = QtWidgets.QLabel("Model Notes:")
-        notes_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-weight: bold; margin-top: 10px;")
-        main_layout.addWidget(notes_label)
-
-        full_text = self.model_def.get("description", "No description.")
-        if self.model_def.get("notes"):
-            full_text += "\n\n" + self.model_def["notes"]
-
-        desc_box = QtWidgets.QTextEdit()
-        desc_box.setReadOnly(True)
-        desc_box.setPlainText(full_text)
-        desc_box.setMaximumHeight(120)
-        desc_box.setStyleSheet(
-            f"background-color: {Theme.BG_PANEL}; border: 1px solid {Theme.BG_BUTTON}; color: {Theme.TEXT_MAIN};"
-        )
-        main_layout.addWidget(desc_box)
-
         override_name = ""
         override_notes = ""
         try:
@@ -1990,25 +1964,33 @@ class ModelDetailDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        edit_group = QtWidgets.QGroupBox("Personal label & notes")
-        edit_layout = QtWidgets.QFormLayout(edit_group)
+        # Header (editable)
+        title_text = override_name.strip() or self.model_def.get("name", self.model_def.get("key", "Model"))
+        self.title_input = QtWidgets.QLineEdit(title_text)
+        f = self.title_input.font()
+        f.setPointSize(16)
+        f.setBold(True)
+        self.title_input.setFont(f)
+        self.title_input.setStyleSheet(
+            f"background-color: {Theme.BG_PANEL}; border: 1px solid {Theme.BG_BUTTON}; color: {Theme.TEXT_MAIN};"
+        )
+        main_layout.addWidget(self.title_input)
 
-        self.custom_name_input = QtWidgets.QLineEdit()
-        self.custom_name_input.setPlaceholderText("Leave blank to use default name")
-        self.custom_name_input.setText(override_name)
-        edit_layout.addRow("Display name", self.custom_name_input)
+        # Notes (editable)
+        notes_label = QtWidgets.QLabel("Model Notes:")
+        notes_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-weight: bold; margin-top: 10px;")
+        main_layout.addWidget(notes_label)
 
-        self.custom_notes_edit = QtWidgets.QTextEdit()
-        self.custom_notes_edit.setPlaceholderText("Personal notes (saved locally)")
-        self.custom_notes_edit.setPlainText(override_notes)
-        self.custom_notes_edit.setMaximumHeight(90)
-        edit_layout.addRow("Personal notes", self.custom_notes_edit)
+        default_notes = self.model_def.get("notes") or self.model_def.get("description") or ""
+        notes_text = override_notes.strip() or str(default_notes)
 
-        self.save_overrides_btn = QtWidgets.QPushButton("Save personal edits")
-        self.save_overrides_btn.clicked.connect(self._save_overrides)
-        edit_layout.addRow("", self.save_overrides_btn)
-
-        main_layout.addWidget(edit_group)
+        self.notes_edit = QtWidgets.QTextEdit()
+        self.notes_edit.setPlainText(notes_text)
+        self.notes_edit.setMaximumHeight(140)
+        self.notes_edit.setStyleSheet(
+            f"background-color: {Theme.BG_PANEL}; border: 1px solid {Theme.BG_BUTTON}; color: {Theme.TEXT_MAIN};"
+        )
+        main_layout.addWidget(self.notes_edit)
 
         # Stats & Graph
         mid_layout = QtWidgets.QHBoxLayout()
@@ -2108,18 +2090,31 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
 
         main_layout.addLayout(mid_layout)
 
+        footer = QtWidgets.QHBoxLayout()
+        self.save_overrides_btn = QtWidgets.QPushButton("Save")
+        self.save_overrides_btn.clicked.connect(self._save_overrides)
+        footer.addWidget(self.save_overrides_btn)
+        footer.addStretch(1)
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.accept)
-        main_layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+        footer.addWidget(close_btn)
+        main_layout.addLayout(footer)
 
     def _save_overrides(self) -> None:
         if self.stats_tab is None or not self._model_key:
             return
-        name = self.custom_name_input.text()
-        notes = self.custom_notes_edit.toPlainText()
+        name = self.title_input.text() if hasattr(self, "title_input") else ""
+        notes = self.notes_edit.toPlainText() if hasattr(self, "notes_edit") else ""
         self.stats_tab.update_model_override(self._model_key, name, notes)
         title_name = name.strip() or self.model_def.get("name") or self._model_key
         self.setWindowTitle(f"Analysis: {title_name}")
+
+    def accept(self):
+        try:
+            self._save_overrides()
+        except Exception:
+            pass
+        super().accept()
 
     def _refresh_saved_sweeps_button(self):
         if not hasattr(self, "btn_saved_sweeps"):

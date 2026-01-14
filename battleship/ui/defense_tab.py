@@ -89,21 +89,27 @@ class DefenseTab(QtWidgets.QWidget):
         main_layout.addWidget(splitter, stretch=1)
 
         board_container = QtWidgets.QWidget()
-        board_container.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        board_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         board_layout = QtWidgets.QGridLayout(board_container)
         board_layout.setSpacing(2)
         board_layout.setContentsMargins(8, 8, 8, 8)
+        board_layout.setAlignment(QtCore.Qt.AlignCenter)
 
+        self._col_labels = []
         for c in range(self.board_size):
             lbl = QtWidgets.QLabel(chr(ord("A") + c))
             lbl.setAlignment(QtCore.Qt.AlignCenter)
             lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
             board_layout.addWidget(lbl, 0, c + 1)
+            self._col_labels.append(lbl)
         for r in range(self.board_size):
             lbl = QtWidgets.QLabel(str(r + 1))
             lbl.setAlignment(QtCore.Qt.AlignCenter)
             lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
             board_layout.addWidget(lbl, r + 1, 0)
+        self._row_labels = []
+        for r in range(self.board_size):
+            self._row_labels.append(board_layout.itemAtPosition(r + 1, 0).widget())
 
         cell_size = self._board_cell_size()
         self.cell_buttons_def = []
@@ -118,15 +124,10 @@ class DefenseTab(QtWidgets.QWidget):
                 board_layout.addWidget(btn, r + 1, c + 1)
             self.cell_buttons_def.append(row)
 
-        grid_size = (self.board_size + 1) * (cell_size + board_layout.spacing())
-        board_container.setFixedSize(grid_size, grid_size)
-
-        board_scroll = wrap_scroll(board_container)
-        board_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        board_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        board_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        board_scroll.setAlignment(QtCore.Qt.AlignCenter)
-        splitter.addWidget(board_scroll)
+        self.board_container = board_container
+        self.board_layout = board_layout
+        board_container.installEventFilter(self)
+        splitter.addWidget(board_container)
 
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
@@ -251,6 +252,34 @@ class DefenseTab(QtWidgets.QWidget):
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+
+        self._resize_board()
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "board_container", None) and event.type() == QtCore.QEvent.Resize:
+            self._resize_board()
+        return super().eventFilter(obj, event)
+
+    def _resize_board(self) -> None:
+        if not hasattr(self, "board_container") or not hasattr(self, "board_layout"):
+            return
+        size = self.board_container.size()
+        spacing = self.board_layout.spacing()
+        l, t, r, b = self.board_layout.getContentsMargins()
+        n = self.board_size + 1
+        avail_w = max(1, size.width() - l - r - spacing * (n - 1))
+        avail_h = max(1, size.height() - t - b - spacing * (n - 1))
+        cell = max(12, min(avail_w // n, avail_h // n))
+
+        for lbl in getattr(self, "_col_labels", []):
+            if lbl:
+                lbl.setFixedSize(cell, cell)
+        for lbl in getattr(self, "_row_labels", []):
+            if lbl:
+                lbl.setFixedSize(cell, cell)
+        for row in self.cell_buttons_def:
+            for btn in row:
+                btn.setFixedSize(cell, cell)
 
     def save_state(self, path: Optional[str] = None):
         if path is None:

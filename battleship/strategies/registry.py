@@ -97,7 +97,7 @@ def model_defs() -> List[Dict[str, object]]:
         {
             "key": "two_ply",
             "name": "Two-ply (Legacy)",
-            "description": "Two-step information heuristic used by the original Attack tab.",
-            "notes": "Included for comparison and backward compatibility.",
+            "description": "Evaluates the expected information gain two moves ahead (1‑ply + 2‑ply lookahead).",
+            "notes": "A legacy heuristic that simulates the split of possible worlds after a shot, then scores the expected reduction one step further.",
         },
     ]
