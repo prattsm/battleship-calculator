@@ -38,12 +38,19 @@ def _parse_cells(text: str) -> Tuple[Tuple[int, int], ...]:
 
 
 class ShipDialog(QtWidgets.QDialog):
-    def __init__(self, ship: Optional[ShipSpec] = None, parent=None, force_shape: bool = False):
+    def __init__(
+        self,
+        ship: Optional[ShipSpec] = None,
+        parent=None,
+        force_shape: bool = False,
+        max_grid: int = 12,
+    ):
         super().__init__(parent)
         self.ship = ship
         self.force_shape = force_shape
         self._grid_updating = False
-        self.grid_size = 6
+        self.max_grid = max(2, int(max_grid))
+        self.grid_size = min(6, self.max_grid)
         self.grid_buttons: List[List[QtWidgets.QToolButton]] = []
         self.setWindowTitle("Ship Editor")
         self.resize(420, 360)
@@ -82,7 +89,7 @@ class ShipDialog(QtWidgets.QDialog):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Grid size"))
         self.grid_spin = QtWidgets.QSpinBox()
-        self.grid_spin.setRange(2, 12)
+        self.grid_spin.setRange(2, self.max_grid)
         self.grid_spin.setValue(self.grid_size)
         self.grid_spin.valueChanged.connect(self._resize_grid)
         row.addWidget(self.grid_spin)
@@ -99,7 +106,7 @@ class ShipDialog(QtWidgets.QDialog):
         self.grid_layout = QtWidgets.QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(2)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        max_size = 12
+        max_size = self.max_grid
         cell = 22
         spacing = self.grid_layout.spacing()
         fixed = (cell * max_size) + (spacing * (max_size - 1))
@@ -231,7 +238,7 @@ class ShipDialog(QtWidgets.QDialog):
         max_c = max((c for _, c in cells), default=0)
         size = max(max_r, max_c, self.grid_size - 1) + 1
         if size != self.grid_size:
-            self.grid_size = min(max(size, 2), 12)
+            self.grid_size = min(max(size, 2), self.max_grid)
             self.grid_spin.blockSignals(True)
             self.grid_spin.setValue(self.grid_size)
             self.grid_spin.blockSignals(False)
@@ -579,7 +586,7 @@ class LayoutsTab(QtWidgets.QWidget):
             self._set_edit_enabled(False)
 
     def _add_ship(self):
-        dialog = ShipDialog(parent=self, force_shape=True)
+        dialog = ShipDialog(parent=self, force_shape=True, max_grid=int(self.board_spin.value()))
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.ship is not None:
             self.ship_specs.append(dialog.ship)
             self._refresh_ship_table()
@@ -588,7 +595,12 @@ class LayoutsTab(QtWidgets.QWidget):
         row = self.ship_table.currentRow()
         if row < 0 or row >= len(self.ship_specs):
             return
-        dialog = ShipDialog(self.ship_specs[row], parent=self, force_shape=True)
+        dialog = ShipDialog(
+            self.ship_specs[row],
+            parent=self,
+            force_shape=True,
+            max_grid=int(self.board_spin.value()),
+        )
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.ship is not None:
             self.ship_specs[row] = dialog.ship
             self._refresh_ship_table()
