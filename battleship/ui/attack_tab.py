@@ -1,5 +1,6 @@
 import math
 import random
+import time
 import uuid
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -792,6 +793,49 @@ class AttackTab(QtWidgets.QWidget):
         self.save_state()
         self.recompute()
 
+    def _rollout_budget(self, unknown_cells_count: int) -> Dict[str, object]:
+        total_cells = self.board_size * self.board_size
+        if total_cells <= 0:
+            return {"enabled": False, "note": "Lookahead skipped (invalid board size)."}
+
+        unknown_ratio = unknown_cells_count / total_cells
+        if unknown_ratio >= 0.85:
+            return {
+                "enabled": False,
+                "note": f"Lookahead throttled (early game: {int(round(unknown_ratio * 100))}% unknown).",
+            }
+
+        if unknown_ratio >= 0.70:
+            scale = 0.25
+            time_limit = 0.35
+        elif unknown_ratio >= 0.55:
+            scale = 0.5
+            time_limit = 0.6
+        elif unknown_ratio >= 0.40:
+            scale = 0.75
+            time_limit = 0.9
+        else:
+            scale = 1.0
+            time_limit = 1.2
+
+        rollouts = max(2, int(round(self.rollout_count * scale)))
+        top_k = max(2, int(round(self.rollout_top_k * scale)))
+
+        max_shots = int(total_cells * (0.35 + 0.65 * (1.0 - unknown_ratio)))
+        max_shots = max(12, min(total_cells, max_shots))
+
+        note = ""
+        if scale < 1.0:
+            note = "Lookahead throttled for responsiveness."
+        return {
+            "enabled": True,
+            "rollouts": rollouts,
+            "top_k": top_k,
+            "max_shots": max_shots,
+            "time_limit": time_limit,
+            "note": note,
+        }
+
     def _simulate_rollout_after_shot(
         self,
         base_board: List[List[str]],
@@ -799,6 +843,7 @@ class AttackTab(QtWidgets.QWidget):
         first_shot: Tuple[int, int],
         model_key: str,
         rng: random.Random,
+        max_shots: Optional[int] = None,
     ) -> int:
         sim_board = [row[:] for row in base_board]
         total_targets = int(bin(world_mask).count("1"))
@@ -821,7 +866,8 @@ class AttackTab(QtWidgets.QWidget):
             if is_hit:
                 remaining -= 1
 
-        max_shots = self.board_size * self.board_size
+        if max_shots is None:
+            max_shots = self.board_size * self.board_size
         while remaining > 0 and shots < max_shots:
             r, c = _choose_next_shot_for_strategy(
                 model_key,
@@ -848,6 +894,8 @@ class AttackTab(QtWidgets.QWidget):
             shots += 1
             if is_hit:
                 remaining -= 1
+        if remaining > 0 and shots >= max_shots:
+            shots += remaining
         return shots
 
     def _apply_rollout_lookahead(
@@ -855,14 +903,15 @@ class AttackTab(QtWidgets.QWidget):
         candidates: List[Dict[str, object]],
         higher_better: bool,
         model_key: str,
-    ) -> Optional[Tuple[Tuple[int, int], float]]:
+        rollouts: int,
+        top_k: int,
+        max_shots: int,
+        time_limit: float,
+    ) -> Optional[Tuple[Tuple[int, int], float, bool]]:
         if not self.rollout_enabled:
             return None
         if not candidates or not self.world_masks:
             return None
-
-        rollouts = max(2, int(self.rollout_count))
-        top_k = max(2, int(self.rollout_top_k))
 
         candidates_sorted = sorted(
             candidates,
@@ -885,18 +934,28 @@ class AttackTab(QtWidgets.QWidget):
         best_cell = None
         best_avg = None
 
+        start = time.time()
+        timed_out = False
         for cell in eval_cells:
             total = 0.0
             for wmask in world_samples:
-                total += self._simulate_rollout_after_shot(self.board, wmask, cell, model_key, rng)
+                if time.time() - start > time_limit:
+                    timed_out = True
+                    break
+                total += self._simulate_rollout_after_shot(
+                    self.board, wmask, cell, model_key, rng, max_shots=max_shots
+                )
+            if time.time() - start > time_limit:
+                timed_out = True
+                break
             avg = total / len(world_samples)
             if best_avg is None or avg < best_avg:
                 best_avg = avg
                 best_cell = cell
-
-        if best_cell is None or best_avg is None:
+        if best_cell is None:
             return None
-        return best_cell, float(best_avg)
+
+        return best_cell, float(best_avg), timed_out
 
     def _model_mode_changed(self):
         if self.auto_phase_rb.isChecked():
@@ -1975,13 +2034,29 @@ class AttackTab(QtWidgets.QWidget):
                 self.best_prob = 0.0
 
         rollout_note = ""
-        if not self.game_over and N > 0 and candidates:
-            rollout_result = self._apply_rollout_lookahead(candidates, higher_better, model_key)
-            if rollout_result is not None:
-                best_cell, avg_shots = rollout_result
-                self.best_cells = [best_cell]
-                self.best_prob = self.cell_probs[cell_index(best_cell[0], best_cell[1], self.board_size)]
-                rollout_note = f"Lookahead: expected remaining shots ~{avg_shots:.1f}"
+        if self.rollout_enabled and not self.game_over and N > 0 and candidates:
+            budget = self._rollout_budget(len(unknown_cells))
+            if not budget.get("enabled", False):
+                rollout_note = str(budget.get("note", "")).strip()
+            else:
+                rollout_result = self._apply_rollout_lookahead(
+                    candidates,
+                    higher_better,
+                    model_key,
+                    rollouts=int(budget.get("rollouts", self.rollout_count)),
+                    top_k=int(budget.get("top_k", self.rollout_top_k)),
+                    max_shots=int(budget.get("max_shots", self.board_size * self.board_size)),
+                    time_limit=float(budget.get("time_limit", 1.0)),
+                )
+                if rollout_result is not None:
+                    best_cell, avg_shots, timed_out = rollout_result
+                    self.best_cells = [best_cell]
+                    self.best_prob = self.cell_probs[cell_index(best_cell[0], best_cell[1], self.board_size)]
+                    rollout_note = f"Lookahead: expected remaining shots ~{avg_shots:.1f}"
+                    if timed_out:
+                        rollout_note += " (throttled)"
+                else:
+                    rollout_note = str(budget.get("note", "")).strip()
 
         warnings = self._compute_warnings()
         self.warning_label.setText(warnings)
