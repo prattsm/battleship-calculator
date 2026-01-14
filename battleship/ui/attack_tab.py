@@ -108,61 +108,42 @@ class AttackTab(QtWidgets.QWidget):
         self.load_state()
         self.recompute()
 
+    def _board_cell_size(self) -> int:
+        base = 520
+        size = int(base / max(1, self.board_size))
+        return max(24, min(48, size))
+
     def _build_ui(self):
-        main_layout = QtWidgets.QHBoxLayout(self)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(24)
+        def wrap_scroll(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            scroll.setWidget(widget)
+            return scroll
 
-        board_container = QtWidgets.QWidget()
-        board_layout = QtWidgets.QGridLayout(board_container)
-        board_layout.setSpacing(2)
-        board_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
 
-        # column labels
-        for c in range(self.board_size):
-            lbl = QtWidgets.QLabel(chr(ord("A") + c))
-            lbl.setAlignment(QtCore.Qt.AlignCenter)
-            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
-            board_layout.addWidget(lbl, 0, c + 1)
-        # row labels
-        for r in range(self.board_size):
-            lbl = QtWidgets.QLabel(str(r + 1))
-            lbl.setAlignment(QtCore.Qt.AlignCenter)
-            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
-            board_layout.addWidget(lbl, r + 1, 0)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(splitter, stretch=1)
 
-        self.cell_buttons: List[List[QtWidgets.QPushButton]] = []
-        for r in range(self.board_size):
-            row = []
-            for c in range(self.board_size):
-                btn = QtWidgets.QPushButton("")
-                btn.setFixedSize(48, 48)
-                btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-                btn.clicked.connect(self._make_cell_handler(r, c))
-                row.append(btn)
-                board_layout.addWidget(btn, r + 1, c + 1)
-            self.cell_buttons.append(row)
+        # --- Left: board + quick actions ---
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
 
-        main_layout.addWidget(board_container, stretch=0, alignment=QtCore.Qt.AlignCenter)
-
-        right_panel = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_panel)
-        right_layout.setSpacing(8)
-
-        header = QtWidgets.QLabel("Tab 1: You attack")
+        header_row = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QLabel("Attack board")
         hfont = header.font()
         hfont.setPointSize(hfont.pointSize() + 1)
         hfont.setBold(True)
         header.setFont(hfont)
-        right_layout.addWidget(header)
-
-        desc = QtWidgets.QLabel(
-            "Click cells to record hits/misses.\n"
-            "The solver maintains a set of plausible layouts, uses information metrics, "
-            "and can optionally enforce which hits belong to which ship."
-        )
-        desc.setWordWrap(True)
-        right_layout.addWidget(desc)
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        left_layout.addLayout(header_row)
 
         overlay_layout = QtWidgets.QHBoxLayout()
         overlay_label = QtWidgets.QLabel("Overlay:")
@@ -171,7 +152,40 @@ class AttackTab(QtWidgets.QWidget):
         self.overlay_combo.currentIndexChanged.connect(self.update_board_view)
         overlay_layout.addWidget(overlay_label)
         overlay_layout.addWidget(self.overlay_combo)
-        right_layout.addLayout(overlay_layout)
+        overlay_layout.addStretch(1)
+        left_layout.addLayout(overlay_layout)
+
+        board_container = QtWidgets.QWidget()
+        board_layout = QtWidgets.QGridLayout(board_container)
+        board_layout.setSpacing(2)
+        board_layout.setContentsMargins(16, 16, 16, 16)
+
+        for c in range(self.board_size):
+            lbl = QtWidgets.QLabel(chr(ord("A") + c))
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+            board_layout.addWidget(lbl, 0, c + 1)
+        for r in range(self.board_size):
+            lbl = QtWidgets.QLabel(str(r + 1))
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+            board_layout.addWidget(lbl, r + 1, 0)
+
+        cell_size = self._board_cell_size()
+        self.cell_buttons = []
+        for r in range(self.board_size):
+            row = []
+            for c in range(self.board_size):
+                btn = QtWidgets.QPushButton("")
+                btn.setFixedSize(cell_size, cell_size)
+                btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+                btn.clicked.connect(self._make_cell_handler(r, c))
+                row.append(btn)
+                board_layout.addWidget(btn, r + 1, c + 1)
+            self.cell_buttons.append(row)
+
+        board_scroll = wrap_scroll(board_container)
+        left_layout.addWidget(board_scroll, stretch=1)
 
         quick_group = QtWidgets.QGroupBox("Quick actions")
         quick_layout = QtWidgets.QVBoxLayout(quick_group)
@@ -198,19 +212,96 @@ class AttackTab(QtWidgets.QWidget):
         quick_layout.addLayout(history_row)
 
         shortcuts_hint = QtWidgets.QLabel(
-            "Left-click cycles unknown -> hit -> miss -> unknown.\n"
+            "Left-click cycles unknown → hit → miss → unknown.\n"
             "Shift=Hit, Alt=Miss, Ctrl=Clear. H/M/U apply to last selected cell."
         )
         shortcuts_hint.setWordWrap(True)
         shortcuts_hint.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
         quick_layout.addWidget(shortcuts_hint)
 
-        right_layout.addWidget(quick_group)
+        left_layout.addWidget(quick_group)
+
+        action_row = QtWidgets.QHBoxLayout()
+        self.recompute_button = QtWidgets.QPushButton("Recompute now")
+        self.recompute_button.clicked.connect(self.recompute)
+        self.clear_attack_button = QtWidgets.QPushButton("Clear board (new game)")
+        self.clear_attack_button.clicked.connect(self.clear_board)
+        action_row.addWidget(self.recompute_button)
+        action_row.addWidget(self.clear_attack_button)
+        left_layout.addLayout(action_row)
+
+        splitter.addWidget(left_panel)
+
+        # --- Right: tabs ---
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Attack assistant")
+        tfont = title.font()
+        tfont.setPointSize(tfont.pointSize() + 1)
+        tfont.setBold(True)
+        title.setFont(tfont)
+        right_layout.addWidget(title)
+
+        desc = QtWidgets.QLabel("Use the tabs below to review insights, models, ships, and stats.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
+        right_layout.addWidget(desc)
+
+        tabs = QtWidgets.QTabWidget()
+        right_layout.addWidget(tabs, stretch=1)
+
+        # Insights tab
+        insights = QtWidgets.QWidget()
+        insights_layout = QtWidgets.QVBoxLayout(insights)
 
         self.warning_label = QtWidgets.QLabel("")
         self.warning_label.setStyleSheet("color: #ff6b6b; font-weight: bold;")
         self.warning_label.setWordWrap(True)
-        right_layout.addWidget(self.warning_label)
+        insights_layout.addWidget(self.warning_label)
+
+        explain_group = QtWidgets.QGroupBox("Why this shot")
+        explain_layout = QtWidgets.QVBoxLayout(explain_group)
+        self.explain_table = QtWidgets.QTableWidget(0, 3)
+        self.explain_table.setHorizontalHeaderLabels(["Cell", "p(hit)", "Score"])
+        self.explain_table.verticalHeader().setVisible(False)
+        self.explain_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.explain_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.explain_table.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        self.explain_table.horizontalHeader().setStretchLastSection(True)
+        explain_layout.addWidget(self.explain_table)
+        self.explain_summary_label = QtWidgets.QLabel("")
+        self.explain_summary_label.setWordWrap(True)
+        explain_layout.addWidget(self.explain_summary_label)
+        insights_layout.addWidget(explain_group)
+
+        whatif_group = QtWidgets.QGroupBox("What-if preview")
+        whatif_layout = QtWidgets.QVBoxLayout(whatif_group)
+        self.whatif_label = QtWidgets.QLabel("No preview yet.")
+        self.whatif_label.setWordWrap(True)
+        whatif_layout.addWidget(self.whatif_label)
+        insights_layout.addWidget(whatif_group)
+
+        self.summary_label = QtWidgets.QLabel("")
+        self.summary_label.setWordWrap(True)
+        insights_layout.addWidget(self.summary_label)
+
+        self.world_mode_label = QtWidgets.QLabel("")
+        self.world_mode_label.setWordWrap(True)
+        insights_layout.addWidget(self.world_mode_label)
+
+        self.best_label = QtWidgets.QLabel("Best guess: (none)")
+        self.best_label.setWordWrap(True)
+        insights_layout.addWidget(self.best_label)
+
+        insights_layout.addStretch(1)
+        tabs.addTab(wrap_scroll(insights), "Insights")
+
+        # Models tab
+        models = QtWidgets.QWidget()
+        models_layout = QtWidgets.QVBoxLayout(models)
 
         model_group = QtWidgets.QGroupBox("Model selection")
         model_layout = QtWidgets.QVBoxLayout(model_group)
@@ -239,59 +330,23 @@ class AttackTab(QtWidgets.QWidget):
         self.active_model_label.setWordWrap(True)
         model_layout.addWidget(self.active_model_label)
 
-        right_layout.addWidget(model_group)
+        models_layout.addWidget(model_group)
+        models_layout.addStretch(1)
+        tabs.addTab(wrap_scroll(models), "Models")
 
-        explain_group = QtWidgets.QGroupBox("Why this shot")
-        explain_layout = QtWidgets.QVBoxLayout(explain_group)
-        self.explain_table = QtWidgets.QTableWidget(0, 3)
-        self.explain_table.setHorizontalHeaderLabels(["Cell", "p(hit)", "Score"])
-        self.explain_table.verticalHeader().setVisible(False)
-        self.explain_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.explain_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self.explain_table.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
-        self.explain_table.horizontalHeader().setStretchLastSection(True)
-        explain_layout.addWidget(self.explain_table)
-        self.explain_summary_label = QtWidgets.QLabel("")
-        self.explain_summary_label.setWordWrap(True)
-        explain_layout.addWidget(self.explain_summary_label)
-        right_layout.addWidget(explain_group)
-
-        whatif_group = QtWidgets.QGroupBox("What-if preview")
-        whatif_layout = QtWidgets.QVBoxLayout(whatif_group)
-        self.whatif_label = QtWidgets.QLabel("No preview yet.")
-        self.whatif_label.setWordWrap(True)
-        whatif_layout.addWidget(self.whatif_label)
-        right_layout.addWidget(whatif_group)
-
-        self.recompute_button = QtWidgets.QPushButton("Recompute now")
-        self.recompute_button.clicked.connect(self.recompute)
-        right_layout.addWidget(self.recompute_button)
-
-        self.clear_attack_button = QtWidgets.QPushButton("Clear board (new game)")
-        self.clear_attack_button.clicked.connect(self.clear_board)
-        right_layout.addWidget(self.clear_attack_button)
-
-        self.summary_label = QtWidgets.QLabel("")
-        self.summary_label.setWordWrap(True)
-        right_layout.addWidget(self.summary_label)
-
-        self.world_mode_label = QtWidgets.QLabel("")
-        self.world_mode_label.setWordWrap(True)
-        right_layout.addWidget(self.world_mode_label)
-
-        self.best_label = QtWidgets.QLabel("Best guess: (none)")
-        self.best_label.setWordWrap(True)
-        right_layout.addWidget(self.best_label)
+        # Ships tab
+        ships = QtWidgets.QWidget()
+        ships_layout = QtWidgets.QVBoxLayout(ships)
 
         sunk_group = QtWidgets.QGroupBox("Mark ships confirmed sunk")
         sunk_layout = QtWidgets.QVBoxLayout(sunk_group)
-        self.sunk_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self.sunk_checkboxes = {}
         for ship in self.ship_ids:
             cb = QtWidgets.QCheckBox(self.ship_friendly_names[ship])
             cb.stateChanged.connect(self._make_sunk_handler(ship))
             sunk_layout.addWidget(cb)
             self.sunk_checkboxes[ship] = cb
-        right_layout.addWidget(sunk_group)
+        ships_layout.addWidget(sunk_group)
 
         assign_group = QtWidgets.QGroupBox("Assign hits to ships (optional)")
         assign_layout = QtWidgets.QVBoxLayout(assign_group)
@@ -299,32 +354,35 @@ class AttackTab(QtWidgets.QWidget):
         self.assign_none_rb.setChecked(True)
         self.assign_none_rb.toggled.connect(self._assign_mode_changed)
         assign_layout.addWidget(self.assign_none_rb)
-        self.assign_ship_rbs: Dict[str, QtWidgets.QRadioButton] = {}
+        self.assign_ship_rbs = {}
         for ship in self.ship_ids:
             rb = QtWidgets.QRadioButton(f"Assign hits to {self.ship_friendly_names[ship]}")
             rb.toggled.connect(self._assign_mode_changed)
             assign_layout.addWidget(rb)
             self.assign_ship_rbs[ship] = rb
-        right_layout.addWidget(assign_group)
+        ships_layout.addWidget(assign_group)
 
-        status_title = QtWidgets.QLabel("Ship status (sunk probability)")
-        stf = status_title.font()
-        stf.setBold(True)
-        status_title.setFont(stf)
-        right_layout.addWidget(status_title)
-
-        self.ship_status_labels: Dict[str, QtWidgets.QLabel] = {}
+        status_group = QtWidgets.QGroupBox("Ship status (sunk probability)")
+        status_layout = QtWidgets.QVBoxLayout(status_group)
+        self.ship_status_labels = {}
         for ship in self.ship_ids:
             lbl = QtWidgets.QLabel(f"{self.ship_friendly_names[ship]}: unknown")
-            right_layout.addWidget(lbl)
+            status_layout.addWidget(lbl)
             self.ship_status_labels[ship] = lbl
+        ships_layout.addWidget(status_group)
 
-        # --- New: game result + win rate group ---
+        ships_layout.addStretch(1)
+        tabs.addTab(wrap_scroll(ships), "Ships")
+
+        # Stats tab
+        stats_page = QtWidgets.QWidget()
+        stats_layout = QtWidgets.QVBoxLayout(stats_page)
+
         stats_group = QtWidgets.QGroupBox("Game result & win rate")
-        stats_layout = QtWidgets.QVBoxLayout(stats_group)
+        stats_group_layout = QtWidgets.QVBoxLayout(stats_group)
         self.stats_label = QtWidgets.QLabel(self.stats.summary_text())
         self.stats_label.setWordWrap(True)
-        stats_layout.addWidget(self.stats_label)
+        stats_group_layout.addWidget(self.stats_label)
 
         btn_row = QtWidgets.QHBoxLayout()
         self.win_button = QtWidgets.QPushButton("Record WIN + new game")
@@ -333,16 +391,20 @@ class AttackTab(QtWidgets.QWidget):
         self.loss_button.clicked.connect(self._record_loss)
         btn_row.addWidget(self.win_button)
         btn_row.addWidget(self.loss_button)
-        stats_layout.addLayout(btn_row)
-        right_layout.addWidget(stats_group)
-        # --- end new block ---
+        stats_group_layout.addLayout(btn_row)
+        stats_layout.addWidget(stats_group)
 
         self.win_prob_label = QtWidgets.QLabel("Win Probability: N/A")
         self.win_prob_label.setStyleSheet(f"color: {Theme.HIGHLIGHT}; font-weight: bold; font-size: 14px;")
-        right_layout.addWidget(self.win_prob_label)  # Add somewhere prominent
+        stats_layout.addWidget(self.win_prob_label)
 
-        right_layout.addStretch(1)
-        main_layout.addWidget(right_panel, stretch=1)
+        stats_layout.addStretch(1)
+        tabs.addTab(wrap_scroll(stats_page), "Stats")
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         self._setup_shortcuts()
 
     def _setup_shortcuts(self):

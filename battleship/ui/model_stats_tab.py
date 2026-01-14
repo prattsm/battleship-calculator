@@ -104,38 +104,45 @@ class ModelStatsTab(QtWidgets.QWidget):
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        # Controls row
-        controls = QtWidgets.QHBoxLayout()
-        layout.addLayout(controls)
+        controls_widget = QtWidgets.QWidget()
+        controls = QtWidgets.QGridLayout(controls_widget)
+        controls.setHorizontalSpacing(12)
+        controls.setVerticalSpacing(8)
 
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.addItem("All models")
         for md in self.model_defs:
             self.model_combo.addItem(md["name"])
-        controls.addWidget(QtWidgets.QLabel("Model:"))
-        controls.addWidget(self.model_combo)
+        controls.addWidget(QtWidgets.QLabel("Model:"), 0, 0)
+        controls.addWidget(self.model_combo, 0, 1)
 
         self.games_spin = QtWidgets.QSpinBox()
         self.games_spin.setRange(10, 100000)
         self.games_spin.setValue(500)
         self.games_spin.setSingleStep(100)
-        controls.addWidget(QtWidgets.QLabel("Games per model:"))
-        controls.addWidget(self.games_spin)
+        controls.addWidget(QtWidgets.QLabel("Games per model:"), 0, 2)
+        controls.addWidget(self.games_spin, 0, 3)
+        controls.setColumnStretch(4, 1)
 
         self.run_button = QtWidgets.QPushButton("Run / Resume")
         self.run_button.clicked.connect(self.run_simulations)
-        controls.addWidget(self.run_button)
-
         self.cancel_button = QtWidgets.QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_simulations)
-        controls.addWidget(self.cancel_button)
-
         self.report_button = QtWidgets.QPushButton("Report Card")
         self.report_button.clicked.connect(self.open_report_card)
-        controls.addWidget(self.report_button)
-        controls.addStretch(1)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.addWidget(self.run_button)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.report_button)
+        actions.addStretch(1)
+        controls.addLayout(actions, 1, 0, 1, 4)
+
+        layout.addWidget(controls_widget)
 
         # Progress bar
         self.progress_bar = QtWidgets.QProgressBar()

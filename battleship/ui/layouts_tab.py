@@ -288,9 +288,13 @@ class LayoutsTab(QtWidgets.QWidget):
         self._refresh_layout_list(select_first=True)
 
     def _build_ui(self):
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, stretch=1)
 
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
@@ -332,7 +336,8 @@ class LayoutsTab(QtWidgets.QWidget):
         btn_row3.addWidget(self.export_all_btn)
         left_layout.addLayout(btn_row3)
 
-        layout.addWidget(left_panel, stretch=0)
+        left_panel.setMinimumWidth(240)
+        splitter.addWidget(left_panel)
 
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
@@ -397,7 +402,13 @@ class LayoutsTab(QtWidgets.QWidget):
         self.status_label.setWordWrap(True)
         right_layout.addWidget(self.status_label)
 
-        layout.addWidget(right_panel, stretch=1)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidget(right_panel)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
 
     def _refresh_layout_list(self, select_first: bool = False, select_id: Optional[str] = None):
         self.custom_layouts = load_custom_layouts(CUSTOM_LAYOUTS_PATH)

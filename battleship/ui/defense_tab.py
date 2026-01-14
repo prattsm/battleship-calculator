@@ -66,15 +66,31 @@ class DefenseTab(QtWidgets.QWidget):
         self.update_board_view()
         self.update_summary_labels()
 
+    def _board_cell_size(self) -> int:
+        base = 520
+        size = int(base / max(1, self.board_size))
+        return max(24, min(48, size))
+
     def _build_ui(self):
-        main_layout = QtWidgets.QHBoxLayout(self)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(24)
+        def wrap_scroll(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            scroll.setWidget(widget)
+            return scroll
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(splitter, stretch=1)
 
         board_container = QtWidgets.QWidget()
         board_layout = QtWidgets.QGridLayout(board_container)
         board_layout.setSpacing(2)
-        board_layout.setContentsMargins(24, 24, 24, 24)
+        board_layout.setContentsMargins(16, 16, 16, 16)
 
         for c in range(self.board_size):
             lbl = QtWidgets.QLabel(chr(ord("A") + c))
@@ -87,25 +103,27 @@ class DefenseTab(QtWidgets.QWidget):
             lbl.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
             board_layout.addWidget(lbl, r + 1, 0)
 
-        self.cell_buttons_def: List[List[QtWidgets.QPushButton]] = []
+        cell_size = self._board_cell_size()
+        self.cell_buttons_def = []
         for r in range(self.board_size):
             row = []
             for c in range(self.board_size):
                 btn = QtWidgets.QPushButton("")
-                btn.setFixedSize(48, 48)
+                btn.setFixedSize(cell_size, cell_size)
                 btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
                 btn.clicked.connect(self._make_cell_handler(r, c))
                 row.append(btn)
                 board_layout.addWidget(btn, r + 1, c + 1)
             self.cell_buttons_def.append(row)
 
-        main_layout.addWidget(board_container, stretch=0, alignment=QtCore.Qt.AlignCenter)
+        splitter.addWidget(wrap_scroll(board_container))
 
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("Tab 2: Opponent attacks you")
+        header = QtWidgets.QLabel("Defense assistant")
         f = header.font()
         f.setPointSize(f.pointSize() + 1)
         f.setBold(True)
@@ -113,23 +131,18 @@ class DefenseTab(QtWidgets.QWidget):
         right_layout.addWidget(header)
 
         desc = QtWidgets.QLabel(
-            "Paint your ships in 'Edit layout' mode.\n"
-            "Switch to 'Record opponent shots' and click where they shoot.\n"
-            "The app learns phase-specific heatmaps and shot sequences, and "
-            "then suggests layouts that are robust to both behaviours."
+            "Place your ships, record opponent shots, and evaluate layouts against attack models."
         )
         desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
         right_layout.addWidget(desc)
 
         self.mode_tabs = QtWidgets.QTabWidget()
-        self.place_tab = QtWidgets.QWidget()
-        self.analyze_tab = QtWidgets.QWidget()
-        self.mode_tabs.addTab(self.place_tab, "Place")
-        self.mode_tabs.addTab(self.analyze_tab, "Analyze")
         self.mode_tabs.currentChanged.connect(self._on_mode_changed)
-        right_layout.addWidget(self.mode_tabs)
+        right_layout.addWidget(self.mode_tabs, stretch=1)
 
-        place_layout = QtWidgets.QVBoxLayout(self.place_tab)
+        place_container = QtWidgets.QWidget()
+        place_layout = QtWidgets.QVBoxLayout(place_container)
         place_ctrl_group = QtWidgets.QGroupBox("Layout controls")
         place_ctrl_layout = QtWidgets.QVBoxLayout(place_ctrl_group)
 
@@ -148,7 +161,11 @@ class DefenseTab(QtWidgets.QWidget):
         place_layout.addWidget(self.place_summary_label)
         place_layout.addStretch(1)
 
-        analyze_layout = QtWidgets.QVBoxLayout(self.analyze_tab)
+        self.place_tab = wrap_scroll(place_container)
+        self.mode_tabs.addTab(self.place_tab, "Place")
+
+        analyze_container = QtWidgets.QWidget()
+        analyze_layout = QtWidgets.QVBoxLayout(analyze_container)
         shots_group = QtWidgets.QGroupBox("Opponent shots")
         shots_layout = QtWidgets.QVBoxLayout(shots_group)
 
@@ -216,9 +233,14 @@ class DefenseTab(QtWidgets.QWidget):
         )
         self.recommendation_label.setWordWrap(True)
         analyze_layout.addWidget(self.recommendation_label)
+        analyze_layout.addStretch(1)
 
-        right_layout.addStretch(1)
-        main_layout.addWidget(right_panel, stretch=1)
+        self.analyze_tab = wrap_scroll(analyze_container)
+        self.mode_tabs.addTab(self.analyze_tab, "Analyze")
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
     def save_state(self, path: Optional[str] = None):
         if path is None:
