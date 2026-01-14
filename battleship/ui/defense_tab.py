@@ -1,12 +1,13 @@
 import random
-from typing import Dict, List, Optional, Tuple
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from battleship.domain.board import cell_index
 from battleship.domain.config import DISP_RADIUS, HAS_SHIP, NO_SHIP, NO_SHOT, SHOT_HIT, SHOT_MISS
 from battleship.layouts.cache import LayoutRuntime
-from battleship.persistence.layout_state import delete_layout_state, load_layout_state, save_layout_state
+from battleship.persistence.layout_state import load_layout_state, save_layout_state
 from battleship.sim.defense_sim import build_base_heat, recommend_layout_phase, simulate_enemy_game_phase
 from battleship.ui.theme import Theme
 
@@ -61,6 +62,10 @@ class DefenseTab(QtWidgets.QWidget):
         self._eval_worker: Optional["DefenseEvalWorker"] = None
         self._eval_progress: Optional[QtWidgets.QProgressDialog] = None
         self.heatmap_checkbox: Optional[QtWidgets.QCheckBox] = None
+
+        self.opponents: Dict[str, Dict[str, object]] = {}
+        self.active_opponent_id: Optional[str] = None
+        self._loading_opponent = False
 
         self._build_ui()
         self.load_state()
@@ -147,6 +152,22 @@ class DefenseTab(QtWidgets.QWidget):
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {Theme.TEXT_LABEL};")
         right_layout.addWidget(desc)
+
+        opponent_row = QtWidgets.QHBoxLayout()
+        opponent_row.addWidget(QtWidgets.QLabel("Opponent:"))
+        self.opponent_combo = QtWidgets.QComboBox()
+        self.opponent_combo.currentIndexChanged.connect(self._on_opponent_changed)
+        opponent_row.addWidget(self.opponent_combo, stretch=1)
+        self.opponent_add_btn = QtWidgets.QPushButton("Add")
+        self.opponent_add_btn.clicked.connect(self._add_opponent)
+        opponent_row.addWidget(self.opponent_add_btn)
+        self.opponent_rename_btn = QtWidgets.QPushButton("Rename")
+        self.opponent_rename_btn.clicked.connect(self._rename_opponent)
+        opponent_row.addWidget(self.opponent_rename_btn)
+        self.opponent_delete_btn = QtWidgets.QPushButton("Delete")
+        self.opponent_delete_btn.clicked.connect(self._delete_opponent)
+        opponent_row.addWidget(self.opponent_delete_btn)
+        right_layout.addLayout(opponent_row)
 
         self.mode_tabs = QtWidgets.QTabWidget()
         self.mode_tabs.currentChanged.connect(self._on_mode_changed)
@@ -250,10 +271,277 @@ class DefenseTab(QtWidgets.QWidget):
         self.mode_tabs.addTab(self.analyze_tab, "Analyze")
 
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([800, 450])
 
         self._resize_board()
+
+    def _blank_board(self, fill_value: int) -> List[List[int]]:
+        return [[fill_value for _ in range(self.board_size)] for _ in range(self.board_size)]
+
+    def _blank_phase_counts(self) -> List[List[List[float]]]:
+        return [
+            [[0.0 for _ in range(self.board_size)] for _ in range(self.board_size)]
+            for _ in range(4)
+        ]
+
+    def _blank_disp_counts(self) -> List[List[List[List[float]]]]:
+        return [
+            [
+                [
+                    [0.0 for _ in range(2 * DISP_RADIUS + 1)]
+                    for _ in range(2 * DISP_RADIUS + 1)
+                ]
+                for _ in range(2)
+            ]
+            for _ in range(4)
+        ]
+
+    def _new_opponent_profile(self, name: str) -> Dict[str, object]:
+        return {
+            "name": name,
+            "layout_board": self._blank_board(NO_SHIP),
+            "shot_board": self._blank_board(NO_SHOT),
+            "hit_counts_phase": self._blank_phase_counts(),
+            "miss_counts_phase": self._blank_phase_counts(),
+            "disp_counts": self._blank_disp_counts(),
+            "history_events": [],
+            "last_shot_for_sequence": None,
+            "mode_tab": 0,
+            "eval_games_per_layout": int(self.eval_games_per_layout),
+            "eval_random_layouts": int(self.eval_random_layouts),
+            "eval_results": {},
+        }
+
+    def _export_profile(self) -> Dict[str, object]:
+        return {
+            "name": self._current_opponent_name(),
+            "layout_board": self.layout_board,
+            "shot_board": self.shot_board,
+            "hit_counts_phase": self.hit_counts_phase,
+            "miss_counts_phase": self.miss_counts_phase,
+            "disp_counts": self.disp_counts,
+            "history_events": [
+                [int(r), int(c), bool(was_hit), int(phase)]
+                for (r, c, was_hit, phase) in self.history_events
+            ],
+            "last_shot_for_sequence": (
+                [int(self.last_shot_for_sequence[0]),
+                 int(self.last_shot_for_sequence[1]),
+                 int(self.last_shot_for_sequence[2]),
+                 bool(self.last_shot_for_sequence[3])]
+                if self.last_shot_for_sequence is not None
+                else None
+            ),
+            "mode_tab": int(self.mode_tabs.currentIndex()) if hasattr(self, "mode_tabs") else 0,
+            "eval_games_per_layout": int(self.eval_games_spin.value()) if hasattr(self, "eval_games_spin") else 0,
+            "eval_random_layouts": int(self.eval_random_spin.value()) if hasattr(self, "eval_random_spin") else 0,
+            "eval_results": self.eval_results,
+        }
+
+    def _import_profile(self, profile: Dict[str, object]) -> None:
+        self._loading_opponent = True
+        try:
+            self.recommended_layout = None
+            self.recommended_mask = 0
+            self.recommended_robust = 0.0
+            self.recommended_heat = 0.0
+            self.recommended_seq = 0.0
+
+            lb = profile.get("layout_board")
+            if (
+                isinstance(lb, list)
+                and len(lb) == self.board_size
+                and all(isinstance(row, list) and len(row) == self.board_size for row in lb)
+            ):
+                self.layout_board = lb
+            else:
+                self.layout_board = self._blank_board(NO_SHIP)
+
+            sb = profile.get("shot_board")
+            if (
+                isinstance(sb, list)
+                and len(sb) == self.board_size
+                and all(isinstance(row, list) and len(row) == self.board_size for row in sb)
+            ):
+                self.shot_board = sb
+            else:
+                self.shot_board = self._blank_board(NO_SHOT)
+
+            hc = profile.get("hit_counts_phase")
+            mc = profile.get("miss_counts_phase")
+            if isinstance(hc, list) and isinstance(mc, list) and len(hc) == 4 and len(mc) == 4:
+                self.hit_counts_phase = hc
+                self.miss_counts_phase = mc
+            else:
+                self.hit_counts_phase = self._blank_phase_counts()
+                self.miss_counts_phase = self._blank_phase_counts()
+
+            dc = profile.get("disp_counts")
+            if isinstance(dc, list) and len(dc) == 4:
+                self.disp_counts = dc
+            else:
+                self.disp_counts = self._blank_disp_counts()
+
+            self.history_events = []
+            he = profile.get("history_events")
+            if isinstance(he, list):
+                for item in he:
+                    if (
+                        isinstance(item, list)
+                        and len(item) == 4
+                        and isinstance(item[0], int)
+                        and isinstance(item[1], int)
+                        and isinstance(item[3], int)
+                    ):
+                        r, c, was_hit, phase = item
+                        if 0 <= r < self.board_size and 0 <= c < self.board_size and 0 <= phase <= 3:
+                            self.history_events.append((r, c, bool(was_hit), phase))
+
+            lss = profile.get("last_shot_for_sequence")
+            if (
+                isinstance(lss, list)
+                and len(lss) == 4
+                and isinstance(lss[0], int)
+                and isinstance(lss[1], int)
+                and isinstance(lss[2], int)
+            ):
+                lr, lc, phase, was_hit = lss
+                if 0 <= lr < self.board_size and 0 <= lc < self.board_size and 0 <= phase <= 3:
+                    self.last_shot_for_sequence = (lr, lc, phase, bool(was_hit))
+                else:
+                    self.last_shot_for_sequence = None
+            else:
+                self.last_shot_for_sequence = None
+
+            mode_tab = profile.get("mode_tab")
+            if isinstance(mode_tab, int) and 0 <= mode_tab < self.mode_tabs.count():
+                self.mode_tabs.setCurrentIndex(mode_tab)
+
+            eval_games = profile.get("eval_games_per_layout")
+            if isinstance(eval_games, int):
+                self.eval_games_per_layout = eval_games
+                self.eval_games_spin.setValue(eval_games)
+            eval_random = profile.get("eval_random_layouts")
+            if isinstance(eval_random, int):
+                self.eval_random_layouts = eval_random
+                self.eval_random_spin.setValue(eval_random)
+
+            eval_results = profile.get("eval_results")
+            if isinstance(eval_results, dict):
+                self.eval_results = eval_results
+                self._update_eval_results_label()
+            else:
+                self.eval_results = {}
+                self._update_eval_results_label()
+        finally:
+            self._loading_opponent = False
+        self.update_board_view()
+        self.update_summary_labels()
+
+    def _current_opponent_name(self) -> str:
+        if self.active_opponent_id and self.active_opponent_id in self.opponents:
+            name = self.opponents[self.active_opponent_id].get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return "Opponent"
+
+    def _refresh_opponent_combo(self, select_id: Optional[str] = None) -> None:
+        if not hasattr(self, "opponent_combo"):
+            return
+        self.opponent_combo.blockSignals(True)
+        self.opponent_combo.clear()
+        for oid, profile in self.opponents.items():
+            name = profile.get("name") if isinstance(profile, dict) else None
+            label = str(name).strip() if isinstance(name, str) and name.strip() else oid
+            self.opponent_combo.addItem(label, userData=oid)
+        if select_id:
+            for i in range(self.opponent_combo.count()):
+                if self.opponent_combo.itemData(i) == select_id:
+                    self.opponent_combo.setCurrentIndex(i)
+                    break
+        self.opponent_combo.blockSignals(False)
+
+    def _ensure_opponents(self) -> None:
+        if not self.opponents:
+            oid = f"opp_{uuid.uuid4().hex[:8]}"
+            self.opponents[oid] = self._new_opponent_profile("Opponent 1")
+            self.active_opponent_id = oid
+        if self.active_opponent_id not in self.opponents:
+            self.active_opponent_id = next(iter(self.opponents))
+        self._refresh_opponent_combo(self.active_opponent_id)
+
+    def _save_current_profile(self) -> None:
+        if not self.active_opponent_id:
+            return
+        self.opponents[self.active_opponent_id] = self._export_profile()
+
+    def _on_opponent_changed(self, index: int) -> None:
+        if self._loading_opponent:
+            return
+        if index < 0:
+            return
+        new_id = self.opponent_combo.itemData(index)
+        if not isinstance(new_id, str) or not new_id:
+            return
+        if new_id == self.active_opponent_id:
+            return
+        self._save_current_profile()
+        self.active_opponent_id = new_id
+        profile = self.opponents.get(new_id)
+        if isinstance(profile, dict):
+            self._import_profile(profile)
+        self.save_state()
+
+    def _add_opponent(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add Opponent", "Opponent name:")
+        if not ok:
+            return
+        name = str(name).strip() or "Opponent"
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        self.opponents[oid] = self._new_opponent_profile(name)
+        self._save_current_profile()
+        self.active_opponent_id = oid
+        self._refresh_opponent_combo(oid)
+        self._import_profile(self.opponents[oid])
+        self.save_state()
+
+    def _rename_opponent(self) -> None:
+        if not self.active_opponent_id:
+            return
+        current_name = self._current_opponent_name()
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename Opponent", "Opponent name:", text=current_name)
+        if not ok:
+            return
+        name = str(name).strip() or current_name
+        profile = self.opponents.get(self.active_opponent_id, {})
+        if isinstance(profile, dict):
+            profile["name"] = name
+            self.opponents[self.active_opponent_id] = profile
+        self._refresh_opponent_combo(self.active_opponent_id)
+        self.save_state()
+
+    def _delete_opponent(self) -> None:
+        if not self.active_opponent_id:
+            return
+        if len(self.opponents) <= 1:
+            QtWidgets.QMessageBox.information(self, "Cannot delete", "At least one opponent profile is required.")
+            return
+        name = self._current_opponent_name()
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Opponent",
+            f"Delete opponent profile '{name}'?\nThis cannot be undone.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        del self.opponents[self.active_opponent_id]
+        self.active_opponent_id = next(iter(self.opponents))
+        self._refresh_opponent_combo(self.active_opponent_id)
+        self._import_profile(self.opponents[self.active_opponent_id])
+        self.save_state()
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "board_container", None) and event.type() == QtCore.QEvent.Resize:
@@ -284,38 +572,14 @@ class DefenseTab(QtWidgets.QWidget):
     def save_state(self, path: Optional[str] = None):
         if path is None:
             path = self.STATE_PATH
-
-        # history_events is List[Tuple[int,int,bool,int]]
-        history_serializable = [
-            [int(r), int(c), bool(was_hit), int(phase)]
-            for (r, c, was_hit, phase) in self.history_events
-        ]
-
-        # last_shot_for_sequence is Optional[Tuple[int,int,int,bool]]
-        if self.last_shot_for_sequence is None:
-            last_seq = None
-        else:
-            lr, lc, phase, was_hit = self.last_shot_for_sequence
-            last_seq = [int(lr), int(lc), int(phase), bool(was_hit)]
+        self._save_current_profile()
 
         state = {
             "layout_id": self.layout.layout_id,
             "layout_version": self.layout.layout_version,
             "layout_hash": self.layout.layout_hash,
-            # long-term learning stats
-            "hit_counts_phase": self.hit_counts_phase,
-            "miss_counts_phase": self.miss_counts_phase,
-            "disp_counts": self.disp_counts,
-
-            # current game state
-            "layout_board": self.layout_board,
-            "shot_board": self.shot_board,
-            "history_events": history_serializable,
-            "last_shot_for_sequence": last_seq,
-            "mode_tab": self.mode_tabs.currentIndex(),
-            "eval_games_per_layout": int(self.eval_games_spin.value()),
-            "eval_random_layouts": int(self.eval_random_spin.value()),
-            "eval_results": self.eval_results,
+            "active_opponent_id": self.active_opponent_id,
+            "opponents": self.opponents,
         }
         save_layout_state(path, self.layout, state)
 
@@ -324,87 +588,50 @@ class DefenseTab(QtWidgets.QWidget):
             path = self.STATE_PATH
         data, _raw = load_layout_state(path, self.layout)
         if not data:
+            self._ensure_opponents()
+            profile = self.opponents.get(self.active_opponent_id, {})
+            if isinstance(profile, dict):
+                self._import_profile(profile)
             return
 
-        # --- long-term learning stats (backwards compatible) ---
-        hc = data.get("hit_counts_phase")
-        mc = data.get("miss_counts_phase")
-        dc = data.get("disp_counts")
-        if isinstance(hc, list) and isinstance(mc, list) and len(hc) == 4 and len(mc) == 4:
-            self.hit_counts_phase = hc
-            self.miss_counts_phase = mc
-        if isinstance(dc, list) and len(dc) == 4:
-            self.disp_counts = dc
-
-        # --- current layout board (optional, for mid-game resume) ---
-        lb = data.get("layout_board")
-        if (
-            isinstance(lb, list)
-            and len(lb) == self.board_size
-            and all(isinstance(row, list) and len(row) == self.board_size for row in lb)
-        ):
-            self.layout_board = lb
-
-        # --- current shot board (optional, for mid-game resume) ---
-        sb = data.get("shot_board")
-        if (
-            isinstance(sb, list)
-            and len(sb) == self.board_size
-            and all(isinstance(row, list) and len(row) == self.board_size for row in sb)
-        ):
-            self.shot_board = sb
-
-        # --- shot history for correct undo behaviour ---
-        he = data.get("history_events")
-        new_history: List[Tuple[int, int, bool, int]] = []
-        if isinstance(he, list):
-            for item in he:
-                if (
-                    isinstance(item, list)
-                    and len(item) == 4
-                    and isinstance(item[0], int)
-                    and isinstance(item[1], int)
-                    and isinstance(item[3], int)
-                ):
-                    r, c, was_hit, phase = item
-                    if 0 <= r < self.board_size and 0 <= c < self.board_size and 0 <= phase <= 3:
-                        new_history.append((r, c, bool(was_hit), phase))
-        self.history_events = new_history
-
-        # --- last shot for sequence model (optional) ---
-        lss = data.get("last_shot_for_sequence")
-        if (
-            isinstance(lss, list)
-            and len(lss) == 4
-            and isinstance(lss[0], int)
-            and isinstance(lss[1], int)
-            and isinstance(lss[2], int)
-        ):
-            lr, lc, phase, was_hit = lss
-            if 0 <= lr < self.board_size and 0 <= lc < self.board_size and 0 <= phase <= 3:
-                self.last_shot_for_sequence = (lr, lc, phase, bool(was_hit))
+        opponents = data.get("opponents")
+        if isinstance(opponents, dict) and opponents:
+            self.opponents = opponents
+            active = data.get("active_opponent_id")
+            if isinstance(active, str) and active in self.opponents:
+                self.active_opponent_id = active
             else:
-                self.last_shot_for_sequence = None
-        else:
-            self.last_shot_for_sequence = None
+                self.active_opponent_id = next(iter(self.opponents))
+            self._ensure_opponents()
+            profile = self.opponents.get(self.active_opponent_id, {})
+            if isinstance(profile, dict):
+                self._import_profile(profile)
+            return
 
-        mode_tab = data.get("mode_tab")
-        if isinstance(mode_tab, int) and 0 <= mode_tab < self.mode_tabs.count():
-            self.mode_tabs.setCurrentIndex(mode_tab)
+        # Legacy single-opponent payload migration
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        profile = self._new_opponent_profile("Opponent 1")
 
-        eval_games = data.get("eval_games_per_layout")
-        if isinstance(eval_games, int):
-            self.eval_games_per_layout = eval_games
-            self.eval_games_spin.setValue(eval_games)
-        eval_random = data.get("eval_random_layouts")
-        if isinstance(eval_random, int):
-            self.eval_random_layouts = eval_random
-            self.eval_random_spin.setValue(eval_random)
+        for key in (
+            "hit_counts_phase",
+            "miss_counts_phase",
+            "disp_counts",
+            "layout_board",
+            "shot_board",
+            "history_events",
+            "last_shot_for_sequence",
+            "mode_tab",
+            "eval_games_per_layout",
+            "eval_random_layouts",
+            "eval_results",
+        ):
+            if key in data:
+                profile[key] = data.get(key)
 
-        eval_results = data.get("eval_results")
-        if isinstance(eval_results, dict):
-            self.eval_results = eval_results
-            self._update_eval_results_label()
+        self.opponents = {oid: profile}
+        self.active_opponent_id = oid
+        self._ensure_opponents()
+        self._import_profile(profile)
 
     def _is_place_mode(self) -> bool:
         return self.mode_tabs.currentIndex() == 0
@@ -569,7 +796,7 @@ class DefenseTab(QtWidgets.QWidget):
         self.recommendation_label.setText(
             "Learning reset.\nRecord opponent shots, then click 'Suggest layout'."
         )
-        delete_layout_state(self.STATE_PATH, self.layout)
+        self.save_state()
 
     def compute_suggested_layout(self):
         layout, mask, robust, avg_heat, avg_seq = recommend_layout_phase(

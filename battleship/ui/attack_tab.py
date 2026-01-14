@@ -412,8 +412,9 @@ class AttackTab(QtWidgets.QWidget):
         tabs.addTab(wrap_scroll(stats_page), "Stats")
 
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([800, 450])
 
         self._setup_shortcuts()
         self._resize_board()

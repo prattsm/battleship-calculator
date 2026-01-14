@@ -4,24 +4,50 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from battleship.domain.config import BOARD_SIZE, DISP_RADIUS, NO_SHOT
 
 
-def build_base_heat(hit_counts, miss_counts, board_size: int = BOARD_SIZE):
+def build_base_heat(
+    hit_counts,
+    miss_counts,
+    board_size: int = BOARD_SIZE,
+    prior: float = 1.0,
+    blend_k: float = 120.0,
+):
+    """Build a smoothed heatmap of opponent shot preferences.
+
+    Uses shot counts (hit + miss) with a Dirichlet-like prior and blends
+    toward uniform when data are sparse.
+    """
     heat = [[0.0 for _ in range(board_size)] for _ in range(board_size)]
+    shot_total = 0.0
+    for r in range(board_size):
+        for c in range(board_size):
+            shot_total += float(hit_counts[r][c]) + float(miss_counts[r][c])
+
     total = 0.0
     for r in range(board_size):
         for c in range(board_size):
-            v = 1.0 + 2.0 * hit_counts[r][c] - 0.5 * miss_counts[r][c]
-            if v < 0.1:
-                v = 0.1
+            v = float(hit_counts[r][c]) + float(miss_counts[r][c]) + float(prior)
             heat[r][c] = v
             total += v
+
     if total <= 0:
+        uniform = 1.0 / (board_size * board_size)
         for r in range(board_size):
             for c in range(board_size):
-                heat[r][c] = 1.0 / (board_size * board_size)
+                heat[r][c] = uniform
         return heat
+
     for r in range(board_size):
         for c in range(board_size):
             heat[r][c] /= total
+
+    uniform = 1.0 / (board_size * board_size)
+    confidence = shot_total / (shot_total + float(blend_k)) if blend_k > 0 else 1.0
+    confidence = max(0.0, min(1.0, confidence))
+    if confidence < 1.0:
+        for r in range(board_size):
+            for c in range(board_size):
+                heat[r][c] = confidence * heat[r][c] + (1.0 - confidence) * uniform
+
     return heat
 
 
@@ -148,7 +174,8 @@ def simulate_enemy_game_phase(
         if total <= 0:
             return base_w
         alpha = 3.0
-        factor = 1.0 + alpha * (count / total)
+        confidence = total / (total + 40.0)
+        factor = 1.0 + alpha * confidence * (count / total)
         return base_w * factor
 
     while shots_taken < max_shots and remaining_mask != 0:
