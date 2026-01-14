@@ -11,6 +11,7 @@ from battleship.ui.attack_tab import AttackTab
 from battleship.ui.defense_tab import DefenseTab
 from battleship.ui.layouts_tab import LayoutsTab
 from battleship.ui.model_stats_tab import ModelStatsTab
+from battleship.ui.check_style import CheckboxRadioStyle
 from battleship.ui.theme import Theme
 from battleship.utils import debug
 
@@ -44,57 +45,7 @@ def apply_dark_palette(app: QtWidgets.QApplication):
     palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
 
     app.setPalette(palette)
-    check_svg = (
-        "data:image/svg+xml;utf8,"
-        "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'>"
-        "<path fill='%23020617' d='M6.1 11.3L2.8 8l1.1-1.1 2.2 2.2 6-6 1.1 1.1z'/>"
-        "</svg>"
-    )
-    ind_svg = (
-        "data:image/svg+xml;utf8,"
-        "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'>"
-        "<rect x='3' y='7' width='10' height='2' fill='%23020617'/>"
-        "</svg>"
-    )
-    radio_svg = (
-        "data:image/svg+xml;utf8,"
-        "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'>"
-        "<circle cx='8' cy='8' r='4' fill='%23020617'/>"
-        "</svg>"
-    )
-    app.setStyleSheet(
-        "\n".join(
-            [
-                "QCheckBox::indicator, QRadioButton::indicator {",
-                "  width: 16px;",
-                "  height: 16px;",
-                f"  border: 1px solid {Theme.TEXT_LABEL};",
-                f"  background-color: {Theme.BG_BUTTON};",
-                "}",
-                "QCheckBox::indicator:checked {",
-                f"  background-color: {Theme.TEXT_LABEL};",
-                f"  border: 1px solid {Theme.TEXT_MAIN};",
-                f"  image: url(\"{check_svg}\");",
-                "}",
-                "QCheckBox::indicator:indeterminate {",
-                f"  background-color: {Theme.TEXT_LABEL};",
-                f"  border: 1px solid {Theme.TEXT_MAIN};",
-                f"  image: url(\"{ind_svg}\");",
-                "}",
-                "QRadioButton::indicator:checked {",
-                f"  background-color: {Theme.TEXT_LABEL};",
-                f"  border: 1px solid {Theme.TEXT_MAIN};",
-                f"  image: url(\"{radio_svg}\");",
-                "}",
-                "QRadioButton::indicator {",
-                "  border-radius: 8px;",
-                "}",
-                "QCheckBox::indicator {",
-                "  border-radius: 3px;",
-                "}",
-            ]
-        )
-    )
+    app.setStyle(CheckboxRadioStyle(app.style()))
 
 
 class MainWindow(QtWidgets.QMainWindow):

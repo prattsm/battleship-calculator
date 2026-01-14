@@ -43,7 +43,6 @@ class ShipDialog(QtWidgets.QDialog):
         self.ship = ship
         self.force_shape = force_shape
         self._grid_updating = False
-        self._lock_pos: Optional[QtCore.QPoint] = None
         self.grid_size = 6
         self.grid_buttons: List[List[QtWidgets.QToolButton]] = []
         self.setWindowTitle("Ship Editor")
@@ -100,7 +99,15 @@ class ShipDialog(QtWidgets.QDialog):
         self.grid_layout = QtWidgets.QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(2)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        shape_layout.addWidget(self.grid_widget)
+        max_size = 12
+        cell = 22
+        spacing = self.grid_layout.spacing()
+        fixed = (cell * max_size) + (spacing * (max_size - 1))
+        self.grid_widget.setFixedSize(fixed, fixed)
+        self.grid_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed
+        )
+        shape_layout.addWidget(self.grid_widget, alignment=QtCore.Qt.AlignLeft)
         legend = QtWidgets.QLabel("Selected cells are highlighted.")
         legend.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
         shape_layout.addWidget(legend)
@@ -134,18 +141,6 @@ class ShipDialog(QtWidgets.QDialog):
 
         self._on_kind_changed()
         self._build_shape_grid(self.grid_size)
-
-    def _lock_position(self, pos: QtCore.QPoint) -> None:
-        self._lock_pos = QtCore.QPoint(pos)
-        QtCore.QTimer.singleShot(75, self._clear_lock)
-
-    def _clear_lock(self) -> None:
-        self._lock_pos = None
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._lock_pos is not None:
-            self.move(self._lock_pos)
 
     def _on_kind_changed(self):
         is_line = self.kind_combo.currentText() == "line"
@@ -199,7 +194,6 @@ class ShipDialog(QtWidgets.QDialog):
         size = int(self.grid_spin.value())
         if size == self.grid_size:
             return
-        self._lock_position(self.pos())
         current = self._grid_cells()
         self.grid_size = size
         self._build_shape_grid(size)
@@ -237,7 +231,6 @@ class ShipDialog(QtWidgets.QDialog):
         max_c = max((c for _, c in cells), default=0)
         size = max(max_r, max_c, self.grid_size - 1) + 1
         if size != self.grid_size:
-            self._lock_position(self.pos())
             self.grid_size = min(max(size, 2), 12)
             self.grid_spin.blockSignals(True)
             self.grid_spin.setValue(self.grid_size)
