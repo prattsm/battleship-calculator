@@ -305,6 +305,7 @@ class ModelStatsTab(QtWidgets.QWidget):
                 k: v for k, v in best_by_phase.items() if isinstance(k, str) and isinstance(v, str)
             }
         overrides = data.get("model_overrides")
+        overrides_updated = False
         if isinstance(overrides, dict):
             cleaned: Dict[str, Dict[str, str]] = {}
             for key, payload in overrides.items():
@@ -320,8 +321,36 @@ class ModelStatsTab(QtWidgets.QWidget):
                 if entry:
                     cleaned[key] = entry
             self.model_overrides = cleaned
+
+            # Migrate stale notes for newly added models if overrides match old defaults.
+            old_notes = {
+                "ucb_explore": {
+                    "Data-free exploration that prefers cells with high posterior uncertainty. Tunable via the UCB bonus parameter.",
+                    "Exploration-leaning variant of Greedy. Helps early when the posterior is flat; too much bonus can be wasteful.",
+                    "A controlled-exploration variant of Greedy. Helps early when the posterior is flat; too much bonus can be wasteful.",
+                },
+                "rollout_mcts": {
+                    "Monte Carlo lookahead with a fast rollout policy. Data-free but heavier to simulate; keep rollouts small in Model Stats.",
+                    "Monte Carlo lookahead with a fast rollout policy. Slower but can reduce total shots when the posterior is ambiguous.",
+                },
+            }
+            default_notes = {md.get("key"): md.get("notes") for md in self._base_model_defs}
+            for key, legacy in old_notes.items():
+                current = cleaned.get(key, {})
+                note = current.get("notes")
+                if isinstance(note, str) and note.strip() in legacy:
+                    new_note = default_notes.get(key)
+                    if isinstance(new_note, str) and new_note.strip():
+                        cleaned[key]["notes"] = new_note.strip()
+                        overrides_updated = True
+            self.model_overrides = cleaned
         self._ensure_all_models()
         self.stale_label.setText("")
+        if overrides_updated:
+            try:
+                self.save_state()
+            except Exception:
+                pass
 
     # ---------------- Stats merge + table ----------------
 
@@ -1944,6 +1973,9 @@ class ModelDetailDialog(QtWidgets.QDialog):
         self.stats_tab = stats_tab
         self.worker: Optional[CustomSimWorker] = None
         self.progress: Optional[QtWidgets.QProgressDialog] = None
+        self._sim_thread = None
+        self._sim_worker = None
+        self._closing_after_workers = False
         self._model_key = str(model_def.get("key") or "")
 
         self.setWindowTitle(f"Analysis: {model_def.get('name', model_def.get('key', 'Model'))}")
