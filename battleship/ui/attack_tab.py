@@ -14,6 +14,8 @@ from battleship.domain.config import (
     HIT,
     MISS,
     PARAM_SPECS,
+    SHOT_HIT,
+    SHOT_MISS,
 )
 from battleship.domain.phase import (
     PHASE_ENDGAME,
@@ -464,33 +466,6 @@ class AttackTab(QtWidgets.QWidget):
 
         ships_layout.addStretch(1)
         tabs.addTab(wrap_scroll(ships), "Ships")
-
-        # Stats tab
-        stats_page = QtWidgets.QWidget()
-        stats_layout = QtWidgets.QVBoxLayout(stats_page)
-
-        stats_group = QtWidgets.QGroupBox("Game result & win rate")
-        stats_group_layout = QtWidgets.QVBoxLayout(stats_group)
-        self.stats_label = QtWidgets.QLabel(self.stats.summary_text())
-        self.stats_label.setWordWrap(True)
-        stats_group_layout.addWidget(self.stats_label)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        self.win_button = QtWidgets.QPushButton("Record WIN + new game")
-        self.loss_button = QtWidgets.QPushButton("Record LOSS + new game")
-        self.win_button.clicked.connect(self._record_win)
-        self.loss_button.clicked.connect(self._record_loss)
-        btn_row.addWidget(self.win_button)
-        btn_row.addWidget(self.loss_button)
-        stats_group_layout.addLayout(btn_row)
-        stats_layout.addWidget(stats_group)
-
-        self.win_prob_label = QtWidgets.QLabel("Win Probability: N/A")
-        self.win_prob_label.setStyleSheet(f"color: {Theme.HIGHLIGHT}; font-weight: bold; font-size: 14px;")
-        stats_layout.addWidget(self.win_prob_label)
-
-        stats_layout.addStretch(1)
-        tabs.addTab(wrap_scroll(stats_page), "Stats")
 
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 4)
@@ -1864,7 +1839,8 @@ class AttackTab(QtWidgets.QWidget):
 
     def _record_game_result(self, win: bool):
         self.stats.record_game(win)
-        self.stats_label.setText(self.stats.summary_text())
+        if hasattr(self, "stats_label"):
+            self.stats_label.setText(self.stats.summary_text())
         try:
             self.game_result.emit(bool(win))
         except Exception:
@@ -1963,6 +1939,8 @@ class AttackTab(QtWidgets.QWidget):
     # In AttackTab class, add the prediction logic:
     def update_win_prediction(self, defense_tab):
         """Simulate Me vs Opponent."""
+        if not hasattr(self, "win_prob_label"):
+            return
         result = self.compute_win_prediction(defense_tab)
         if result is None:
             self.win_prob_label.setText("Win Prob: N/A (Need Defense Layout)")
@@ -2122,7 +2100,21 @@ class AttackTab(QtWidgets.QWidget):
                 total_comps += 1
 
         prob = (wins / total_comps) * 100 if total_comps else 0
-        return prob, float(my_total), float(opp_avg)
+
+        my_shots = sum(row.count(HIT) + row.count(MISS) for row in self.board)
+        opp_shots = sum(
+            row.count(SHOT_HIT) + row.count(SHOT_MISS) for row in defense_tab.shot_board
+        )
+        shot_diff = my_shots - opp_shots
+        baseline = 50.0 - (4.0 * shot_diff)
+        baseline = max(5.0, min(95.0, baseline))
+        total_shots = my_shots + opp_shots
+        denom = max(10.0, float(self.board_size) * 1.5)
+        weight = min(1.0, total_shots / denom)
+        adj_prob = baseline + weight * (prob - baseline)
+        adj_prob = max(0.0, min(100.0, adj_prob))
+
+        return float(adj_prob), float(my_total), float(opp_avg)
 
     def recompute(self, defense_tab=None):
         # Rebuild world samples and ship-sunk probabilities

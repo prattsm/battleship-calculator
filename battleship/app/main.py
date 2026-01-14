@@ -416,6 +416,13 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.match_record_label.setText("Record: 0-0")
 
+        my_shots = 0
+        opp_shots = 0
+        if hasattr(self, "attack_tab"):
+            my_shots = sum(row.count(HIT) + row.count(MISS) for row in self.attack_tab.board)
+        if hasattr(self, "defense_tab"):
+            opp_shots = sum(row.count(SHOT_HIT) + row.count(SHOT_MISS) for row in self.defense_tab.shot_board)
+
         if hasattr(self, "attack_tab") and hasattr(self, "defense_tab"):
             result = self.attack_tab.compute_win_prediction(self.defense_tab)
         else:
@@ -424,16 +431,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.match_win_label.setText("Live win%: N/A")
         else:
             win_pct, my_total, opp_avg = result
-            self.match_win_label.setText(
-                f"Live win%: {win_pct:.1f}% (You: ~{my_total:.1f} vs Opp: ~{opp_avg:.1f})"
-            )
-
-        my_shots = 0
-        opp_shots = 0
-        if hasattr(self, "attack_tab"):
-            my_shots = sum(row.count(HIT) + row.count(MISS) for row in self.attack_tab.board)
-        if hasattr(self, "defense_tab"):
-            opp_shots = sum(row.count(SHOT_HIT) + row.count(SHOT_MISS) for row in self.defense_tab.shot_board)
+            total_shots = my_shots + opp_shots
+            if total_shots < 4:
+                self.match_win_label.setText(f"Live win%: {win_pct:.1f}%")
+            else:
+                self.match_win_label.setText(
+                    f"Live win%: {win_pct:.1f}% (You: ~{my_total:.1f} vs Opp: ~{opp_avg:.1f})"
+                )
         self.match_shots_label.setText(f"Shots: You {my_shots} | Opp {opp_shots}")
         next_turn = "You" if my_shots <= opp_shots else "Opponent"
         self.match_turn_label.setText(f"Next shot: {next_turn}")
