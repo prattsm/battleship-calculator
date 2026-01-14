@@ -1595,15 +1595,27 @@ class ParamSweepDialog(QtWidgets.QDialog):
 
         r += 1
         lbl_coarse = QtWidgets.QLabel("Coarse factor:")
+        lbl_coarse.setToolTip(
+            "Run a low-resolution pass first by widening the step size. Higher values sample fewer points."
+        )
         self.sb_coarse_factor = QtWidgets.QDoubleSpinBox()
         self.sb_coarse_factor.setRange(1.0, 10.0)
         self.sb_coarse_factor.setSingleStep(0.5)
         self.sb_coarse_factor.setValue(2.0)
+        self.sb_coarse_factor.setToolTip(
+            "Run a low-resolution pass first by widening the step size. Higher values sample fewer points."
+        )
         self.sb_coarse_factor.valueChanged.connect(self._update_counts)
         lbl_refine = QtWidgets.QLabel("Refine top N:")
+        lbl_refine.setToolTip(
+            "After the coarse pass, refine around the best N settings."
+        )
         self.sb_refine_top = QtWidgets.QSpinBox()
         self.sb_refine_top.setRange(1, 10)
         self.sb_refine_top.setValue(1)
+        self.sb_refine_top.setToolTip(
+            "After the coarse pass, refine around the best N settings."
+        )
         self.sb_refine_top.valueChanged.connect(self._update_counts)
         grid.addWidget(lbl_coarse, r, 0)
         grid.addWidget(self.sb_coarse_factor, r, 1)
@@ -1612,16 +1624,26 @@ class ParamSweepDialog(QtWidgets.QDialog):
 
         r += 1
         lbl_max_points = QtWidgets.QLabel("Max points:")
+        lbl_max_points.setToolTip(
+            "Hard cap on how many parameter combinations to evaluate. 0 means no limit."
+        )
         self.sb_max_points = QtWidgets.QSpinBox()
         self.sb_max_points.setRange(0, self.MAX_TOTAL_CONFIGS)
         self.sb_max_points.setValue(0)
-        self.sb_max_points.setToolTip("0 = no limit")
+        self.sb_max_points.setToolTip(
+            "Hard cap on how many parameter combinations to evaluate. 0 means no limit."
+        )
         self.sb_max_points.valueChanged.connect(self._update_counts)
         lbl_time = QtWidgets.QLabel("Time budget (sec):")
+        lbl_time.setToolTip(
+            "Stop the sweep once this many seconds have elapsed. 0 means no limit."
+        )
         self.sb_time_budget = QtWidgets.QSpinBox()
         self.sb_time_budget.setRange(0, 36000)
         self.sb_time_budget.setValue(0)
-        self.sb_time_budget.setToolTip("0 = no limit")
+        self.sb_time_budget.setToolTip(
+            "Stop the sweep once this many seconds have elapsed. 0 means no limit."
+        )
         self.sb_time_budget.valueChanged.connect(self._update_counts)
         grid.addWidget(lbl_max_points, r, 0)
         grid.addWidget(self.sb_max_points, r, 1)
@@ -1630,10 +1652,15 @@ class ParamSweepDialog(QtWidgets.QDialog):
 
         r += 1
         lbl_early = QtWidgets.QLabel("Early stop (no-improve points):")
+        lbl_early.setToolTip(
+            "Stop after this many consecutive points without improvement. 0 disables."
+        )
         self.sb_early_stop = QtWidgets.QSpinBox()
         self.sb_early_stop.setRange(0, self.MAX_TOTAL_CONFIGS)
         self.sb_early_stop.setValue(0)
-        self.sb_early_stop.setToolTip("0 = disable")
+        self.sb_early_stop.setToolTip(
+            "Stop after this many consecutive points without improvement. 0 disables."
+        )
         self.sb_early_stop.valueChanged.connect(self._update_counts)
         grid.addWidget(lbl_early, r, 0)
         grid.addWidget(self.sb_early_stop, r, 1)
