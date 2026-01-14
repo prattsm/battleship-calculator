@@ -993,57 +993,6 @@ class AttackTab(QtWidgets.QWidget):
             shots += remaining
         return shots
 
-    def _simulate_remaining_shots(
-        self,
-        base_board: List[List[str]],
-        world_mask: int,
-        model_key: str,
-        rng: random.Random,
-        max_shots: Optional[int] = None,
-    ) -> int:
-        sim_board = [row[:] for row in base_board]
-        total_targets = int(bin(world_mask).count("1"))
-        hits = 0
-        for r in range(self.board_size):
-            for c in range(self.board_size):
-                if sim_board[r][c] == HIT:
-                    idx = cell_index(r, c, self.board_size)
-                    if (world_mask >> idx) & 1:
-                        hits += 1
-        remaining = max(0, total_targets - hits)
-
-        shots = 0
-        if max_shots is None:
-            max_shots = self.board_size * self.board_size
-        while remaining > 0 and shots < max_shots:
-            r, c = _choose_next_shot_for_strategy(
-                model_key,
-                sim_board,
-                self.placements,
-                rng,
-                self.ship_ids,
-                board_size=self.board_size,
-            )
-            if sim_board[r][c] != EMPTY:
-                unknown = [
-                    (rr, cc)
-                    for rr in range(self.board_size)
-                    for cc in range(self.board_size)
-                    if sim_board[rr][cc] == EMPTY
-                ]
-                if not unknown:
-                    break
-                r, c = rng.choice(unknown)
-            idx = cell_index(r, c, self.board_size)
-            is_hit = (world_mask >> idx) & 1
-            sim_board[r][c] = HIT if is_hit else MISS
-            shots += 1
-            if is_hit:
-                remaining -= 1
-        if remaining > 0 and shots >= max_shots:
-            shots += remaining
-        return shots
-
     def _apply_rollout_lookahead(
         self,
         candidates: List[Dict[str, object]],
@@ -2028,22 +1977,103 @@ class AttackTab(QtWidgets.QWidget):
         if not self.world_masks or not getattr(defense_tab, "layout_board", None):
             return None
 
-        # 1. Estimate MY remaining shots using the active model.
+        # 1. Estimate MY remaining shots using a fast, static ordering based on current probabilities.
         my_rem_samples = []
         rng = random.Random()
-        model_key = self.active_model_key
-        if not model_key:
-            model_key, _reason, _best = self._resolve_active_model(self.active_phase)
-        if not model_key:
-            model_key = "two_ply"
+        sample_worlds = rng.sample(self.world_masks, min(6, len(self.world_masks)))
 
-        sample_worlds = rng.sample(self.world_masks, min(8, len(self.world_masks)))
-        unknown_count = sum(row.count(EMPTY) for row in self.board)
-        max_shots = max(1, unknown_count)
+        unknown_cells = []
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self.board[r][c] == EMPTY:
+                    unknown_cells.append((r, c))
+        if not unknown_cells:
+            return None
+
+        if not getattr(self, "cell_probs", None):
+            return None
+        if len(self.cell_probs) != self.board_size * self.board_size:
+            return None
+
+        known_hit_mask = 0
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self.board[r][c] == HIT:
+                    known_hit_mask |= 1 << cell_index(r, c, self.board_size)
+
+        def pick_best_unknown(sim_board, candidates=None):
+            best = None
+            best_p = -1.0
+            if candidates is None:
+                for rr in range(self.board_size):
+                    for cc in range(self.board_size):
+                        if sim_board[rr][cc] != EMPTY:
+                            continue
+                        idx = cell_index(rr, cc, self.board_size)
+                        p = self.cell_probs[idx]
+                        if p > best_p + 1e-12:
+                            best_p = p
+                            best = (rr, cc)
+                        elif best is not None and abs(p - best_p) <= 1e-12 and rng.random() < 0.5:
+                            best = (rr, cc)
+            else:
+                for rr, cc in candidates:
+                    if sim_board[rr][cc] != EMPTY:
+                        continue
+                    idx = cell_index(rr, cc, self.board_size)
+                    p = self.cell_probs[idx]
+                    if p > best_p + 1e-12:
+                        best_p = p
+                        best = (rr, cc)
+                    elif best is not None and abs(p - best_p) <= 1e-12 and rng.random() < 0.5:
+                        best = (rr, cc)
+            return best
+
+        def simulate_fast(w_mask: int) -> int:
+            sim_board = [row[:] for row in self.board]
+            remaining = bin(w_mask & ~known_hit_mask).count("1")
+            if remaining <= 0:
+                return 0
+
+            frontier = set()
+            for rr in range(self.board_size):
+                for cc in range(self.board_size):
+                    if sim_board[rr][cc] != HIT:
+                        continue
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr = rr + dr
+                        nc = cc + dc
+                        if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                            if sim_board[nr][nc] == EMPTY:
+                                frontier.add((nr, nc))
+
+            shots = 0
+            max_shots = len(unknown_cells)
+            while remaining > 0 and shots < max_shots:
+                cell = pick_best_unknown(sim_board, frontier if frontier else None)
+                if cell is None:
+                    break
+                r, c = cell
+                idx = cell_index(r, c, self.board_size)
+                is_hit = (w_mask >> idx) & 1
+                sim_board[r][c] = HIT if is_hit else MISS
+                shots += 1
+                if (r, c) in frontier:
+                    frontier.discard((r, c))
+                if is_hit:
+                    remaining -= 1
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr = r + dr
+                        nc = c + dc
+                        if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                            if sim_board[nr][nc] == EMPTY:
+                                frontier.add((nr, nc))
+            if remaining > 0 and shots >= max_shots:
+                shots += remaining
+            return shots
 
         for w_mask in sample_worlds:
-            shots = self._simulate_remaining_shots(self.board, w_mask, model_key, rng, max_shots=max_shots)
-            my_rem_samples.append(shots)
+            my_rem_samples.append(simulate_fast(w_mask))
 
         if not my_rem_samples:
             return None
