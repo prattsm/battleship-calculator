@@ -103,6 +103,7 @@ class ModelStatsTab(QtWidgets.QWidget):
 
         self._sim_thread: Optional[QtCore.QThread] = None
         self._sim_worker: Optional[SimulationWorker] = None
+        self._last_checkpoint_save = 0.0
 
         self._build_ui()
         self.load_state()
@@ -688,6 +689,7 @@ class ModelStatsTab(QtWidgets.QWidget):
 
         self._sim_thread.started.connect(self._sim_worker.run)
         self._sim_worker.progress.connect(self._on_worker_progress)
+        self._sim_worker.checkpoint.connect(self._on_worker_checkpoint)
         self._sim_worker.finished.connect(self._on_worker_finished)
         self._sim_worker.finished.connect(self._sim_thread.quit)
         self._sim_worker.finished.connect(self._sim_worker.deleteLater)
@@ -704,6 +706,17 @@ class ModelStatsTab(QtWidgets.QWidget):
     def _on_worker_progress(self, done: int, total: int):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(done)
+
+    @QtCore.pyqtSlot(dict, int, int)
+    def _on_worker_checkpoint(self, delta_stats: Dict[str, Dict[str, object]], done: int, total: int):
+        if not delta_stats:
+            return
+        for key, delta in delta_stats.items():
+            self._merge_model_stats(key, delta)
+        now = time.time()
+        if now - self._last_checkpoint_save >= 2.0:
+            self.save_state()
+            self._last_checkpoint_save = now
 
     @QtCore.pyqtSlot(dict)
     def _on_worker_finished(self, delta_stats: Dict[str, Dict[str, object]]):
@@ -727,6 +740,7 @@ class ModelStatsTab(QtWidgets.QWidget):
 
 class SimulationWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, int)  # done, total
+    checkpoint = QtCore.pyqtSignal(dict, int, int)  # delta stats, done, total
     finished = QtCore.pyqtSignal(dict)  # key -> delta stats
 
     def __init__(
@@ -747,6 +761,25 @@ class SimulationWorker(QtCore.QObject):
     def cancel(self):
         self._cancelled = True
 
+    def _blank_stats(self) -> Dict[str, object]:
+        return {
+            "total_games": 0,
+            "total_shots": 0.0,
+            "sum_sq_shots": 0.0,
+            "min_shots": 0,
+            "max_shots": 0,
+            "hist": [0] * (self.total_cells + 1),
+            "phase": {
+                phase: {
+                    "total_games": 0,
+                    "total_shots": 0.0,
+                    "sum_sq_shots": 0.0,
+                    "hist": [0] * (self.total_cells + 1),
+                }
+                for phase in PHASES
+            },
+        }
+
     @QtCore.pyqtSlot()
     def run(self):
         rng = random.Random()
@@ -757,26 +790,16 @@ class SimulationWorker(QtCore.QObject):
 
         # NEW: Update roughly every 1% or every 1 game, whichever is larger
         update_interval = max(1, total_jobs // 100)
+        checkpoint_interval = max(1, total_jobs // 20)
 
         done = 0
-        results: Dict[str, Dict[str, object]] = {}
+        pending: Dict[str, Dict[str, object]] = {}
+        last_checkpoint_done = 0
 
         for key, num_to_run in self.work_order.items():
-            total_games = 0
-            total_shots = 0.0
-            sum_sq = 0.0
-            min_shots = 0
-            max_shots = 0
-            hist = [0] * (self.total_cells + 1)
-            phase_stats = {
-                phase: {
-                    "total_games": 0,
-                    "total_shots": 0.0,
-                    "sum_sq_shots": 0.0,
-                    "hist": [0] * (self.total_cells + 1),
-                }
-                for phase in PHASES
-            }
+            if key not in pending:
+                pending[key] = self._blank_stats()
+            stats = pending[key]
 
             for _ in range(num_to_run):
                 if self._cancelled:
@@ -789,27 +812,33 @@ class SimulationWorker(QtCore.QObject):
                     rng,
                 )
 
-                total_games += 1
-                total_shots += shots
-                sum_sq += shots * shots
+                stats["total_games"] = int(stats.get("total_games", 0)) + 1
+                stats["total_shots"] = float(stats.get("total_shots", 0.0)) + shots
+                stats["sum_sq_shots"] = float(stats.get("sum_sq_shots", 0.0)) + (shots * shots)
 
-                if total_games == 1:
-                    min_shots = max_shots = shots
+                if stats["total_games"] == 1:
+                    stats["min_shots"] = shots
+                    stats["max_shots"] = shots
                 else:
-                    if shots < min_shots:
-                        min_shots = shots
-                    if shots > max_shots:
-                        max_shots = shots
+                    stats["min_shots"] = min(int(stats.get("min_shots", shots)), shots)
+                    stats["max_shots"] = max(int(stats.get("max_shots", shots)), shots)
 
+                hist = stats.get("hist")
+                if not isinstance(hist, list) or len(hist) < self.total_cells + 1:
+                    hist = [0] * (self.total_cells + 1)
                 if 0 <= shots < len(hist):
                     hist[shots] += 1
                 else:
                     hist[-1] += 1
+                stats["hist"] = hist
 
                 if phase_counts:
+                    phase_stats = stats.get("phase")
+                    if not isinstance(phase_stats, dict):
+                        phase_stats = self._blank_stats().get("phase", {})
                     for phase in PHASES:
                         phase_shots = int(phase_counts.get(phase, 0))
-                        entry = phase_stats[phase]
+                        entry = phase_stats.get(phase, {})
                         entry["total_games"] = int(entry.get("total_games", 0)) + 1
                         entry["total_shots"] = float(entry.get("total_shots", 0.0)) + phase_shots
                         entry["sum_sq_shots"] = float(entry.get("sum_sq_shots", 0.0)) + (phase_shots * phase_shots)
@@ -820,31 +849,25 @@ class SimulationWorker(QtCore.QObject):
                         phist[idx] += 1
                         entry["hist"] = phist
                         phase_stats[phase] = entry
+                    stats["phase"] = phase_stats
 
                 done += 1
                 # NEW: Smoother progress emission
                 if done % update_interval == 0 or done == total_jobs:
                     self.progress.emit(done, total_jobs)
-
-            if total_games <= 0:
-                if self._cancelled:
-                    break
-                continue
-
-            results[key] = {
-                "total_games": total_games,
-                "total_shots": total_shots,
-                "sum_sq_shots": sum_sq,
-                "min_shots": min_shots,
-                "max_shots": max_shots,
-                "hist": hist,
-                "phase": phase_stats,
-            }
+                if done - last_checkpoint_done >= checkpoint_interval:
+                    payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
+                    if payload:
+                        self.checkpoint.emit(payload, done, total_jobs)
+                        for k in payload.keys():
+                            pending[k] = self._blank_stats()
+                        last_checkpoint_done = done
 
             if self._cancelled:
                 break
 
-        self.finished.emit(results)
+        final_payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
+        self.finished.emit(final_payload)
 
 
 class CustomSimWorker(QtCore.QThread):
