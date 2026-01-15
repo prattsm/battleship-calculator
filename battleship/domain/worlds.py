@@ -299,9 +299,9 @@ def sample_worlds(
     # If any ship has no legal placement, there are no consistent worlds.
     for ship in ship_ids:
         if not allowed[ship]:
-            return [], [0] * (board_size * board_size), {
-                s: 0.0 for s in ship_ids
-            }, 0
+            if return_ship_masks:
+                return [], [], [0] * (board_size * board_size), {s: 0.0 for s in ship_ids}, 0
+            return [], [0] * (board_size * board_size), {s: 0.0 for s in ship_ids}, 0
 
     # Decide enumeration vs Monte Carlo
     remaining_ships = [s for s in ship_ids if s not in confirmed_sunk]
