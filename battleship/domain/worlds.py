@@ -1,6 +1,9 @@
 import math
+import os
+import pickle
 import random
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+import multiprocessing as mp
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .board import board_masks, make_mask
 from .config import (
@@ -13,6 +16,24 @@ from .config import (
 PlacementLike = object
 
 
+def build_placement_index(
+    placements: Dict[str, List[PlacementLike]],
+    board_size: int = BOARD_SIZE,
+) -> Dict[str, Dict[int, List[int]]]:
+    index: Dict[str, Dict[int, List[int]]] = {}
+    for ship, plist in placements.items():
+        cell_map: Dict[int, List[int]] = {}
+        for i, p in enumerate(plist):
+            cells = getattr(p, "cells", None)
+            if not cells:
+                continue
+            for r, c in cells:
+                idx = r * board_size + c
+                cell_map.setdefault(idx, []).append(i)
+        index[ship] = cell_map
+    return index
+
+
 def filter_allowed_placements(
     placements: Dict[str, List[PlacementLike]],
     hit_mask: int,
@@ -20,14 +41,34 @@ def filter_allowed_placements(
     confirmed_sunk: Set[str],
     assigned_hits: Dict[str, Set[Tuple[int, int]]],
     board_size: int = BOARD_SIZE,
+    placement_index: Optional[Dict[str, Dict[int, List[int]]]] = None,
 ) -> Dict[str, List[PlacementLike]]:
     filtered: Dict[str, List[PlacementLike]] = {}
     for ship, plist in placements.items():
         required_cells = assigned_hits.get(ship, set())
         required_mask = make_mask(list(required_cells), board_size) if required_cells else 0
         is_sunk = ship in confirmed_sunk
+        candidates = plist
+        if required_cells and placement_index:
+            cell_map = placement_index.get(ship) or {}
+            candidate_indices: Optional[Set[int]] = None
+            for r, c in required_cells:
+                idx = r * board_size + c
+                idx_list = cell_map.get(idx)
+                if not idx_list:
+                    candidate_indices = set()
+                    break
+                if candidate_indices is None:
+                    candidate_indices = set(idx_list)
+                else:
+                    candidate_indices &= set(idx_list)
+                if not candidate_indices:
+                    break
+            if candidate_indices is not None:
+                candidates = [plist[i] for i in sorted(candidate_indices)]
+
         new_list: List[PlacementLike] = []
-        for p in plist:
+        for p in candidates:
             # cannot overlap misses
             if p.mask & miss_mask:
                 continue
@@ -95,6 +136,94 @@ def random_world(
     return union_mask, ship_masks
 
 
+def _mc_worker(args):
+    allowed, ship_ids, hit_mask, seed, target, max_attempts, placement_weights = args
+    rng = random.Random(seed)
+    seen: Set[int] = set()
+    worlds_union: List[int] = []
+    worlds_ship_masks: List[Tuple[int, ...]] = []
+    attempts = 0
+    while len(worlds_union) < target and attempts < max_attempts:
+        attempts += 1
+        res = random_world(allowed, ship_ids, hit_mask, rng, placement_weights=placement_weights)
+        if res is None:
+            continue
+        union_mask, ship_masks_tuple = res
+        if union_mask in seen:
+            continue
+        seen.add(union_mask)
+        worlds_union.append(union_mask)
+        worlds_ship_masks.append(ship_masks_tuple)
+    return worlds_union, worlds_ship_masks
+
+
+def filter_worlds_by_constraints(
+    worlds_union: List[int],
+    worlds_ship_masks: List[Tuple[int, ...]],
+    ship_ids: Sequence[str],
+    hit_mask: int,
+    miss_mask: int,
+    confirmed_sunk: Set[str],
+    assigned_hit_masks: Sequence[int],
+) -> Tuple[List[int], List[Tuple[int, ...]]]:
+    filtered_union: List[int] = []
+    filtered_ship_masks: List[Tuple[int, ...]] = []
+    for union_mask, ship_masks_tuple in zip(worlds_union, worlds_ship_masks):
+        if union_mask & miss_mask:
+            continue
+        if (union_mask & hit_mask) != hit_mask:
+            continue
+        ok = True
+        for i, ship in enumerate(ship_ids):
+            m_ship = ship_masks_tuple[i]
+            req_mask = assigned_hit_masks[i] if i < len(assigned_hit_masks) else 0
+            if req_mask and (req_mask & ~m_ship) != 0:
+                ok = False
+                break
+            if ship in confirmed_sunk and (m_ship & ~hit_mask) != 0:
+                ok = False
+                break
+        if ok:
+            filtered_union.append(union_mask)
+            filtered_ship_masks.append(ship_masks_tuple)
+    return filtered_union, filtered_ship_masks
+
+
+def summarize_worlds(
+    worlds_union: List[int],
+    worlds_ship_masks: List[Tuple[int, ...]],
+    ship_ids: Sequence[str],
+    hit_mask: int,
+    board_size: int,
+    confirmed_sunk: Optional[Set[str]] = None,
+) -> Tuple[List[int], Dict[str, float]]:
+    N = len(worlds_union)
+    cell_hit_counts = [0] * (board_size * board_size)
+    ship_sunk_counts = {s: 0 for s in ship_ids}
+
+    for union_mask, ship_masks_tuple in zip(worlds_union, worlds_ship_masks):
+        m = union_mask
+        idx = 0
+        while idx < board_size * board_size:
+            if m & 1:
+                cell_hit_counts[idx] += 1
+            m >>= 1
+            idx += 1
+
+        for i, ship in enumerate(ship_ids):
+            m_ship = ship_masks_tuple[i]
+            if (m_ship & ~hit_mask) == 0:
+                ship_sunk_counts[ship] += 1
+
+    ship_sunk_probs: Dict[str, float] = {}
+    for ship in ship_ids:
+        if confirmed_sunk and ship in confirmed_sunk:
+            ship_sunk_probs[ship] = 1.0
+        else:
+            ship_sunk_probs[ship] = ship_sunk_counts[ship] / N if N > 0 else 0.0
+    return cell_hit_counts, ship_sunk_probs
+
+
 def enumerate_worlds(
     allowed: Dict[str, List[PlacementLike]],
     ship_ids: Sequence[str],
@@ -135,7 +264,16 @@ def sample_worlds(
     rng_seed: Optional[int] = None,
     board_size: Optional[int] = None,
     cell_prior: Optional[List[float]] = None,
-) -> Tuple[List[int], List[int], Dict[str, float], int]:
+    target_worlds: Optional[int] = None,
+    max_attempts_factor: Optional[int] = None,
+    existing_union: Optional[List[int]] = None,
+    existing_ship_masks: Optional[List[Tuple[int, ...]]] = None,
+    return_ship_masks: bool = False,
+    placement_index: Optional[Dict[str, Dict[int, List[int]]]] = None,
+) -> Union[
+    Tuple[List[int], List[int], Dict[str, float], int],
+    Tuple[List[int], List[Tuple[int, ...]], List[int], Dict[str, float], int],
+]:
     """
     Return:
       - list of union masks for each world
@@ -149,7 +287,13 @@ def sample_worlds(
 
     hit_mask, miss_mask = board_masks(board, board_size)
     allowed = filter_allowed_placements(
-        placements, hit_mask, miss_mask, confirmed_sunk, assigned_hits, board_size
+        placements,
+        hit_mask,
+        miss_mask,
+        confirmed_sunk,
+        assigned_hits,
+        board_size,
+        placement_index=placement_index,
     )
 
     # If any ship has no legal placement, there are no consistent worlds.
@@ -183,6 +327,14 @@ def sample_worlds(
     worlds_ship_masks: List[Tuple[int, ...]] = []
     seen: Set[int] = set()
 
+    if existing_union and existing_ship_masks and len(existing_union) == len(existing_ship_masks):
+        for union_mask, ship_masks_tuple in zip(existing_union, existing_ship_masks):
+            if union_mask in seen:
+                continue
+            seen.add(union_mask)
+            worlds_union.append(union_mask)
+            worlds_ship_masks.append(ship_masks_tuple)
+
     if enumeration:
         # Exact enumeration (capped at ENUMERATION_PRODUCT_LIMIT worlds)
         worlds_union, worlds_ship_masks = enumerate_worlds(
@@ -191,8 +343,11 @@ def sample_worlds(
     else:
         # Monte Carlo sampling of distinct worlds
         rng = random.Random(rng_seed)
+        target = target_worlds if isinstance(target_worlds, int) and target_worlds > 0 else WORLD_SAMPLE_TARGET
         attempts = 0
-        max_attempts = WORLD_SAMPLE_TARGET * WORLD_MAX_ATTEMPTS_FACTOR
+        factor = max_attempts_factor if isinstance(max_attempts_factor, int) and max_attempts_factor > 0 else WORLD_MAX_ATTEMPTS_FACTOR
+        needed = max(0, target - len(worlds_union))
+        max_attempts = max(1, needed * factor)
         placement_weights: Optional[Dict[str, List[float]]] = None
         if cell_prior is not None and len(cell_prior) == board_size * board_size:
             placement_weights = {}
@@ -213,7 +368,41 @@ def sample_worlds(
                     weights.append(max(1e-6, s))
                 placement_weights[ship] = weights
 
-        while len(worlds_union) < WORLD_SAMPLE_TARGET and attempts < max_attempts:
+        use_parallel = False
+        if needed >= 1000 and os.cpu_count() and os.cpu_count() > 1:
+            try:
+                start_method = mp.get_start_method()
+            except RuntimeError:
+                start_method = mp.get_start_method(allow_none=True) or "spawn"
+            if start_method == "fork":
+                try:
+                    pickle.dumps(allowed)
+                    use_parallel = True
+                except Exception:
+                    use_parallel = False
+
+        if use_parallel and needed > 0:
+            workers = min(os.cpu_count() or 1, 4)
+            per_worker = max(1, int(math.ceil(needed / workers)))
+            per_attempts = max(1, per_worker * factor)
+            seeds = [rng.randint(0, 2**31 - 1) for _ in range(workers)]
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=workers) as pool:
+                args_list = [
+                    (allowed, ship_ids, hit_mask, seeds[i], per_worker, per_attempts, placement_weights)
+                    for i in range(workers)
+                ]
+                for worker_union, worker_masks in pool.map(_mc_worker, args_list):
+                    for union_mask, ship_masks_tuple in zip(worker_union, worker_masks):
+                        if len(worlds_union) >= target:
+                            break
+                        if union_mask in seen:
+                            continue
+                        seen.add(union_mask)
+                        worlds_union.append(union_mask)
+                        worlds_ship_masks.append(ship_masks_tuple)
+
+        while len(worlds_union) < target and attempts < max_attempts:
             attempts += 1
             res = random_world(allowed, ship_ids, hit_mask, rng, placement_weights=placement_weights)
             if res is None:
@@ -259,40 +448,16 @@ def sample_worlds(
     N = len(worlds_union)
     if N == 0:
         # No worlds consistent with hits/misses + sunk checkboxes
-        return [], [0] * (board_size * board_size), {
-            s: 0.0 for s in ship_ids
-        }, 0
+        if return_ship_masks:
+            return [], [], [0] * (board_size * board_size), {s: 0.0 for s in ship_ids}, 0
+        return [], [0] * (board_size * board_size), {s: 0.0 for s in ship_ids}, 0
 
-    # Per-cell hit counts
-    cell_hit_counts = [0] * (board_size * board_size)
-    ship_sunk_counts = {s: 0 for s in ship_ids}
+    cell_hit_counts, ship_sunk_probs = summarize_worlds(
+        worlds_union, worlds_ship_masks, ship_ids, hit_mask, board_size, confirmed_sunk=confirmed_sunk
+    )
 
-    for w_idx in range(N):
-        union_mask = worlds_union[w_idx]
-
-        # Cell hits
-        m = union_mask
-        idx = 0
-        while idx < board_size * board_size:
-            if m & 1:
-                cell_hit_counts[idx] += 1
-            m >>= 1
-            idx += 1
-
-        # Per-ship sunk: in this world, a ship is sunk if all its cells are hits
-        ship_masks_tuple = worlds_ship_masks[w_idx]
-        for i, ship in enumerate(ship_ids):
-            m_ship = ship_masks_tuple[i]
-            if (m_ship & ~hit_mask) == 0:
-                ship_sunk_counts[ship] += 1
-
-    ship_sunk_probs: Dict[str, float] = {}
-    for ship in ship_ids:
-        if ship in confirmed_sunk:
-            ship_sunk_probs[ship] = 1.0
-        else:
-            ship_sunk_probs[ship] = ship_sunk_counts[ship] / N
-
+    if return_ship_masks:
+        return worlds_union, worlds_ship_masks, cell_hit_counts, ship_sunk_probs, N
     return worlds_union, cell_hit_counts, ship_sunk_probs, N
 
 

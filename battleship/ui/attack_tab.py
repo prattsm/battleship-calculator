@@ -16,6 +16,7 @@ from battleship.domain.config import (
     PARAM_SPECS,
     SHOT_HIT,
     SHOT_MISS,
+    WORLD_SAMPLE_TARGET,
 )
 from battleship.domain.phase import (
     PHASE_ENDGAME,
@@ -24,8 +25,11 @@ from battleship.domain.phase import (
     classify_phase,
 )
 from battleship.domain.worlds import (
+    build_placement_index,
     compute_min_expected_worlds_after_one_shot,
     filter_allowed_placements,
+    filter_worlds_by_constraints,
+    summarize_worlds,
     sample_worlds,
 )
 from battleship.layouts.cache import LayoutRuntime
@@ -112,6 +116,8 @@ class AttackTab(QtWidgets.QWidget):
         self._opponent_prior_confidence: float = 0.0
         self._opponent_prior_total: float = 0.0
         self._world_cache_key = None
+        self.world_ship_masks: List[Tuple[int, ...]] = []
+        self._placement_index = build_placement_index(self.placements, self.board_size)
 
         # Lookahead rollouts
         self.rollout_enabled: bool = False
@@ -2131,18 +2137,82 @@ class AttackTab(QtWidgets.QWidget):
         prior_key = None
         if cell_prior is not None:
             prior_key = tuple(int(v) for v in self.opponent_cell_counts)
-        cache_key = (hit_mask, miss_mask, confirmed_key, assigned_masks, prior_key)
+        target_worlds = WORLD_SAMPLE_TARGET
+        cache_key = (hit_mask, miss_mask, confirmed_key, assigned_masks, prior_key, target_worlds)
+        reuse_prior = False
+        can_reuse = False
+        if self._world_cache_key is not None and len(self._world_cache_key) >= 6:
+            reuse_prior = (self._world_cache_key[4] == prior_key)
+            try:
+                prev_hit, prev_miss, prev_confirmed, prev_assigned, _prev_prior, _prev_target = (
+                    self._world_cache_key
+                )
+                prev_confirmed_set = set(prev_confirmed)
+                new_confirmed_set = set(confirmed_key)
+                hits_stricter = (hit_mask | prev_hit) == hit_mask
+                misses_stricter = (miss_mask | prev_miss) == miss_mask
+                confirmed_stricter = prev_confirmed_set.issubset(new_confirmed_set)
+                assigned_stricter = True
+                if isinstance(prev_assigned, tuple) and len(prev_assigned) == len(assigned_masks):
+                    for prev_mask, new_mask in zip(prev_assigned, assigned_masks):
+                        if prev_mask & ~new_mask:
+                            assigned_stricter = False
+                            break
+                else:
+                    assigned_stricter = False
+                can_reuse = reuse_prior and hits_stricter and misses_stricter and confirmed_stricter and assigned_stricter
+            except Exception:
+                can_reuse = False
+
+        filtered_union: Optional[List[int]] = None
+        filtered_masks: Optional[List[Tuple[int, ...]]] = None
+        if can_reuse and self.world_ship_masks:
+            filtered_union, filtered_masks = filter_worlds_by_constraints(
+                self.world_masks,
+                self.world_ship_masks,
+                self.ship_ids,
+                hit_mask,
+                miss_mask,
+                self.confirmed_sunk,
+                assigned_masks,
+            )
 
         if cache_key != self._world_cache_key:
-            self.world_masks, self.cell_hit_counts, self.ship_sunk_probs, self.num_world_samples = sample_worlds(
-                self.board,
-                self.placements,
-                self.ship_ids,
-                self.confirmed_sunk,
-                self.assigned_hits,
-                board_size=self.board_size,
-                cell_prior=cell_prior,
-            )
+            if filtered_union is not None and filtered_masks is not None and len(filtered_union) >= target_worlds:
+                self.world_masks = filtered_union[:target_worlds]
+                self.world_ship_masks = filtered_masks[:target_worlds]
+                self.cell_hit_counts, self.ship_sunk_probs = summarize_worlds(
+                    self.world_masks,
+                    self.world_ship_masks,
+                    self.ship_ids,
+                    hit_mask,
+                    self.board_size,
+                    confirmed_sunk=self.confirmed_sunk,
+                )
+                self.num_world_samples = len(self.world_masks)
+            else:
+                existing_union = filtered_union if filtered_union is not None else None
+                existing_masks = filtered_masks if filtered_masks is not None else None
+                (
+                    self.world_masks,
+                    self.world_ship_masks,
+                    self.cell_hit_counts,
+                    self.ship_sunk_probs,
+                    self.num_world_samples,
+                ) = sample_worlds(
+                    self.board,
+                    self.placements,
+                    self.ship_ids,
+                    self.confirmed_sunk,
+                    self.assigned_hits,
+                    board_size=self.board_size,
+                    cell_prior=cell_prior,
+                    target_worlds=target_worlds,
+                    existing_union=existing_union,
+                    existing_ship_masks=existing_masks,
+                    return_ship_masks=True,
+                    placement_index=self._placement_index,
+                )
             self._world_cache_key = cache_key
 
         N = self.num_world_samples
@@ -2166,6 +2236,7 @@ class AttackTab(QtWidgets.QWidget):
                 self.confirmed_sunk,
                 self.assigned_hits,
                 self.board_size,
+                placement_index=self._placement_index,
             )
 
             force_enumeration = (self.remaining_ship_count == 1)
