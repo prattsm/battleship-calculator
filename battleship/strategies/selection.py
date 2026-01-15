@@ -292,9 +292,10 @@ def _choose_next_shot_for_strategy(
                     best_mass = mass
                     best_cells = cells
 
-        if best_cells:
-            return max(best_cells, key=lambda rc: cell_probs[cell_index(rc[0], rc[1], board_size)])
-        return rng.choice(unknown_cells)
+        if strategy == "dynamic_parity":
+            if best_cells:
+                return max(best_cells, key=lambda rc: cell_probs[cell_index(rc[0], rc[1], board_size)])
+            return rng.choice(unknown_cells)
 
     if strategy == "rollout_mcts":
         rollouts = max(2, int(params.get("rollouts", 6)))
