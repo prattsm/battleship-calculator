@@ -67,7 +67,7 @@ def random_world(
     placement_weights: Optional[Dict[str, List[float]]] = None,
 ) -> Optional[Tuple[int, Tuple[int, ...]]]:
     used_mask = 0
-    ship_masks: List[int] = []
+    ship_masks_by_id: Dict[str, int] = {}
     ship_sequence = list(ship_ids)
     rng.shuffle(ship_sequence)
     for ship in ship_sequence:
@@ -83,7 +83,7 @@ def random_world(
             if p.mask & used_mask:
                 continue
             used_mask |= p.mask
-            ship_masks.append(p.mask)
+            ship_masks_by_id[ship] = p.mask
             placed = True
             break
         if not placed:
@@ -91,7 +91,8 @@ def random_world(
     union_mask = used_mask
     if (union_mask & hit_mask) != hit_mask:
         return None
-    return union_mask, tuple(ship_masks)
+    ship_masks = tuple(ship_masks_by_id[s] for s in ship_ids)
+    return union_mask, ship_masks
 
 
 def enumerate_worlds(

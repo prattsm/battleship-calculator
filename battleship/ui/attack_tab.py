@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from battleship.domain.board import board_masks, cell_index, create_board
+from battleship.domain.board import board_masks, cell_index, create_board, make_mask
 from battleship.domain.config import (
     EMPTY,
     ENUMERATION_PRODUCT_LIMIT,
@@ -111,6 +111,7 @@ class AttackTab(QtWidgets.QWidget):
         self._using_opponent_prior: bool = False
         self._opponent_prior_confidence: float = 0.0
         self._opponent_prior_total: float = 0.0
+        self._world_cache_key = None
 
         # Lookahead rollouts
         self.rollout_enabled: bool = False
@@ -2119,15 +2120,30 @@ class AttackTab(QtWidgets.QWidget):
     def recompute(self, defense_tab=None):
         # Rebuild world samples and ship-sunk probabilities
         cell_prior = self._compute_opponent_prior()
-        self.world_masks, self.cell_hit_counts, self.ship_sunk_probs, self.num_world_samples = sample_worlds(
-            self.board,
-            self.placements,
-            self.ship_ids,
-            self.confirmed_sunk,
-            self.assigned_hits,
-            board_size=self.board_size,
-            cell_prior=cell_prior,
+        hit_mask, miss_mask = board_masks(self.board, self.board_size)
+        assigned_masks = tuple(
+            make_mask(list(self.assigned_hits.get(ship, set())), self.board_size)
+            if self.assigned_hits.get(ship)
+            else 0
+            for ship in self.ship_ids
         )
+        confirmed_key = tuple(sorted(self.confirmed_sunk))
+        prior_key = None
+        if cell_prior is not None:
+            prior_key = tuple(int(v) for v in self.opponent_cell_counts)
+        cache_key = (hit_mask, miss_mask, confirmed_key, assigned_masks, prior_key)
+
+        if cache_key != self._world_cache_key:
+            self.world_masks, self.cell_hit_counts, self.ship_sunk_probs, self.num_world_samples = sample_worlds(
+                self.board,
+                self.placements,
+                self.ship_ids,
+                self.confirmed_sunk,
+                self.assigned_hits,
+                board_size=self.board_size,
+                cell_prior=cell_prior,
+            )
+            self._world_cache_key = cache_key
 
         N = self.num_world_samples
         if N > 0:
@@ -2143,7 +2159,6 @@ class AttackTab(QtWidgets.QWidget):
             self.remaining_ship_count = len(remaining_ships)
 
             # Recompute allowed placements to estimate the search-space size.
-            hit_mask, miss_mask = board_masks(self.board, self.board_size)
             allowed = filter_allowed_placements(
                 self.placements,
                 hit_mask,
