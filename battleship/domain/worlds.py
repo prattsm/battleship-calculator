@@ -245,11 +245,7 @@ def sample_worlds(
                 if (m_ship & ~hit_mask) != 0:
                     ok = False
                     break
-            else:
-                # Not marked sunk: must still have at least one non-hit cell
-                if (m_ship & ~hit_mask) == 0:
-                    ok = False
-                    break
+            # If not marked sunk, leave it unconstrained (unknown).
 
         if ok:
             filtered_union.append(union_mask)
