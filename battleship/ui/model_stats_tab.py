@@ -143,6 +143,13 @@ class ModelStatsTab(QtWidgets.QWidget):
         controls.addWidget(self.games_spin, 0, 3)
         controls.setColumnStretch(4, 1)
 
+        self.additive_cb = QtWidgets.QCheckBox("Add games (ignore existing totals)")
+        self.additive_cb.setChecked(True)
+        self.additive_cb.setToolTip(
+            "When checked, runs the full number for each selected model.\n"
+            "When unchecked, only tops up models below the target."
+        )
+
         self.run_button = QtWidgets.QPushButton("Run / Resume")
         self.run_button.clicked.connect(self.run_simulations)
         self.cancel_button = QtWidgets.QPushButton("Cancel")
@@ -156,7 +163,8 @@ class ModelStatsTab(QtWidgets.QWidget):
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.report_button)
         actions.addStretch(1)
-        controls.addLayout(actions, 1, 0, 1, 4)
+        controls.addWidget(self.additive_cb, 1, 0, 1, 2)
+        controls.addLayout(actions, 1, 2, 1, 2)
 
         layout.addWidget(controls_widget)
 
@@ -645,6 +653,7 @@ class ModelStatsTab(QtWidgets.QWidget):
 
         idx = self.model_combo.currentIndex()
         target_games = self.games_spin.value()  # This is the "Goal" number
+        additive_mode = bool(getattr(self, "additive_cb", None) and self.additive_cb.isChecked())
 
         # Determine which models to run
         if idx == 0:
@@ -652,7 +661,7 @@ class ModelStatsTab(QtWidgets.QWidget):
         else:
             candidates = [self.model_defs[idx - 1]["key"]]
 
-        # Calculate actual work needed (Incremental Simulation)
+        # Calculate actual work needed
         work_order = {}  # key -> games_to_run
         total_jobs = 0
 
@@ -660,8 +669,13 @@ class ModelStatsTab(QtWidgets.QWidget):
             current_stats = self.model_stats.get(key, {})
             current_games = int(current_stats.get("total_games", 0))
 
-            if current_games < target_games:
+            if additive_mode:
+                needed = target_games
+            else:
+                if current_games >= target_games:
+                    continue
                 needed = target_games - current_games
+            if needed > 0:
                 work_order[key] = needed
                 total_jobs += needed
 
