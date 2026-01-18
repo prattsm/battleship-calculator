@@ -23,6 +23,16 @@ python -m unittest discover -s tests
 python scripts/smoke_run.py
 ```
 
+## Model Sim Multiprocessing
+Model Stats simulations can run in parallel to reduce wall-clock time. Results are deterministic for a fixed global seed, regardless of worker count or chunk size.
+
+Env flags:
+- `SIM_MULTIPROC=auto|1|0` (default: auto; enables if cpu>=4)
+- `SIM_WORKERS=<int>` (clamped to 1..cpu; default: cpu-2, cap 12)
+- `SIM_CHUNK_GAMES=<int>|auto` (default: 25; auto targets ~0.5-2.0s per chunk)
+- `SIM_GLOBAL_SEED=<int>` (default: 1337; guarantees deterministic aggregates)
+- `SIM_DEBUG_STATS=1` (adds assertions/logs for phase counts and checkpoint payloads)
+
 ## User Guide
 - Layout selector: choose built-in or custom layouts; last selection persists across launches.
 - Attack tab: click cells to cycle states, use Shift/Alt/Ctrl shortcuts, undo/redo, and review heatmaps, “Why this shot”, and “What-if” previews.
