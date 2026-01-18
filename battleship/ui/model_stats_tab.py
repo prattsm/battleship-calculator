@@ -938,6 +938,11 @@ class SimulationWorker(QtCore.QObject):
             },
         }
 
+    def _reset_stats_in_place(self, stats: Dict[str, object]) -> None:
+        blank = self._blank_stats()
+        stats.clear()
+        stats.update(blank)
+
     @QtCore.pyqtSlot()
     def run(self):
         rng = random.Random()
@@ -1025,7 +1030,7 @@ class SimulationWorker(QtCore.QObject):
                     if payload:
                         self.checkpoint.emit(payload, done, total_jobs)
                         for k in payload.keys():
-                            pending[k] = self._blank_stats()
+                            self._reset_stats_in_place(pending[k])
                         last_checkpoint_done = done
 
             if self._cancelled:
