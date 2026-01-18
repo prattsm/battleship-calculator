@@ -54,10 +54,12 @@ class SimProfiler:
         self.topups = 0
         self.filter_time = 0.0
         self.filter_events = 0
-        self.worlds_survived = 0
+        self.worlds_before_filter = 0
+        self.worlds_after_filter = 0
         self.selection_time = 0.0
         self.selection_ex_sample = 0.0
         self._last_sample_time = 0.0
+        self.posterior_calls = 0
 
     def record_layout_time(self, dt: float) -> None:
         self.layout_time += float(dt)
@@ -74,14 +76,18 @@ class SimProfiler:
         self._last_sample_time = 0.0
         return dt
 
-    def record_filter(self, dt: float, n_worlds: int) -> None:
+    def record_filter(self, dt: float, before_count: int, after_count: int) -> None:
         self.filter_time += float(dt)
         self.filter_events += 1
-        self.worlds_survived += int(n_worlds)
+        self.worlds_before_filter += int(before_count)
+        self.worlds_after_filter += int(after_count)
 
     def record_selection(self, dt: float, sample_time: float = 0.0) -> None:
         self.selection_time += float(dt)
         self.selection_ex_sample += max(0.0, float(dt) - float(sample_time))
+
+    def record_posterior_call(self) -> None:
+        self.posterior_calls += 1
 
     def record_shot(self) -> None:
         self.shots += 1
@@ -96,10 +102,17 @@ class SimProfiler:
         avg_sample_per_shot = self.sample_time / shots
         avg_select_ex = self.selection_ex_sample / shots
         avg_filter = self.filter_time / max(1, self.filter_events)
-        avg_worlds = self.worlds_survived / max(1, self.filter_events)
+        avg_worlds_after = self.worlds_after_filter / max(1, self.filter_events)
+        avg_worlds_before = self.worlds_before_filter / max(1, self.filter_events)
+        survival_rate = (
+            self.worlds_after_filter / self.worlds_before_filter
+            if self.worlds_before_filter > 0
+            else 0.0
+        )
         avg_calls = self.sample_calls / games
         avg_topups = self.topups / games
         avg_layout = self.layout_time / games
+        posterior_per_shot = self.posterior_calls / shots
         return (
             f"[SIM_PROFILE] {label}\n"
             f"  games={self.games} shots={self.shots}\n"
@@ -108,8 +121,11 @@ class SimProfiler:
             f"({avg_sample_per_game:.4f}s/game, {avg_sample_per_shot:.6f}s/shot)\n"
             f"  sample_calls={self.sample_calls} ({avg_calls:.2f}/game), "
             f"topups={self.topups} ({avg_topups:.2f}/game)\n"
+            f"  posterior_calls={self.posterior_calls} ({posterior_per_shot:.2f}/shot)\n"
             f"  filter_time={self.filter_time:.4f}s ({avg_filter:.6f}s/shot), "
-            f"avg_worlds_after_filter={avg_worlds:.1f}\n"
+            f"avg_worlds_before_filter={avg_worlds_before:.1f}, "
+            f"avg_worlds_after_filter={avg_worlds_after:.1f}, "
+            f"survival_rate={survival_rate:.3f}\n"
             f"  selection_ex_sampling={self.selection_ex_sample:.4f}s "
             f"({avg_select_ex:.6f}s/shot)"
         )
@@ -154,9 +170,10 @@ class WorldCache:
     ) -> int:
         if not self.unions:
             if profiler is not None:
-                profiler.record_filter(0.0, 0)
+                profiler.record_filter(0.0, 0, 0)
             return 0
         start = time.perf_counter()
+        before_count = len(self.unions)
         filtered_union: List[int] = []
         filtered_masks: List[Tuple[int, ...]] = []
         removed = 0
@@ -183,7 +200,7 @@ class WorldCache:
         self.unions = filtered_union
         self.ship_masks = filtered_masks
         if profiler is not None:
-            profiler.record_filter(time.perf_counter() - start, len(self.unions))
+            profiler.record_filter(time.perf_counter() - start, before_count, len(self.unions))
         return removed
 
     def top_up(
@@ -293,9 +310,16 @@ def _simulate_model_game(
     fast_mode = _env_flag("SIM_FAST_MODE", True)
     base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
     target_worlds = _target_worlds_for_strategy(strategy, base_target)
-    min_keep = _env_int("SIM_MIN_KEEP", max(1, target_worlds // 5))
+    min_keep_default = max(500, target_worlds // 10)
+    min_keep = _env_int("SIM_MIN_KEEP", min_keep_default)
     if min_keep > target_worlds:
         min_keep = target_worlds
+    refill_default = min(4000, target_worlds)
+    refill_target = _env_int("SIM_REFILL_TARGET", refill_default)
+    if refill_target > target_worlds:
+        refill_target = target_worlds
+    if refill_target < min_keep:
+        refill_target = min_keep
     world_cache = WorldCache(ship_ids, board_size) if fast_mode else None
     sim_placements = placements
     frozen_ships: set[str] = set()
@@ -345,10 +369,12 @@ def _simulate_model_game(
                     confirmed_sunk,
                     assigned_hits,
                     rng,
-                    target_worlds=target_worlds,
+                    target_worlds=refill_target,
                     profiler=profiler,
                 )
             posterior = world_cache.posterior()
+            if profiler is not None:
+                profiler.record_posterior_call()
             selection_start = time.perf_counter()
             r, c = _choose_next_shot_for_strategy(
                 strategy,

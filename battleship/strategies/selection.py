@@ -183,6 +183,7 @@ def _choose_next_shot_for_strategy(
         if profiler is not None:
             try:
                 profiler.record_sample(sample_time, N, topup=False)
+                profiler.record_posterior_call()
             except Exception:
                 pass
     else:
