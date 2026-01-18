@@ -1001,6 +1001,8 @@ class SimulationWorker(QtCore.QObject):
                     rng,
                     profiler=profilers.get(key) if profile_enabled else None,
                 )
+                if profilers.get(key) is not None and phase_counts:
+                    profilers[key].record_phase_shots(sum(phase_counts.values()))
 
                 stats["total_games"] = int(stats.get("total_games", 0)) + 1
                 stats["total_shots"] = float(stats.get("total_shots", 0.0)) + shots
@@ -1075,6 +1077,10 @@ class SimulationWorker(QtCore.QObject):
             if self._cancelled:
                 break
             if profile_enabled and key in profilers and profilers[key].games > 0:
+                if _sim_debug_stats_enabled():
+                    assert (
+                        profilers[key].phase_shots == profilers[key].posterior_calls
+                    ), f"Phase shots mismatch for {key}: {profilers[key].phase_shots} vs {profilers[key].posterior_calls}"
                 summary = profilers[key].format_summary(f"model={key}")
                 print(summary)
                 profilers[key].reset()

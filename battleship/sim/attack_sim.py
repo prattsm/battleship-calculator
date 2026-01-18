@@ -118,6 +118,7 @@ class SimProfiler:
         self.selection_ex_sample = 0.0
         self._last_sample_time = 0.0
         self.posterior_calls = 0
+        self.phase_shots = 0
         self.posterior_used_by_phase: Dict[str, int] = {}
         self.posterior_skipped_by_phase: Dict[str, int] = {}
 
@@ -151,6 +152,9 @@ class SimProfiler:
         key = phase or "unknown"
         target = self.posterior_used_by_phase if used else self.posterior_skipped_by_phase
         target[key] = int(target.get(key, 0)) + 1
+
+    def record_phase_shots(self, count: int) -> None:
+        self.phase_shots += int(count)
 
     def record_topup(
         self,
@@ -568,7 +572,6 @@ def _simulate_model_game(
                     )
             posterior = world_cache.posterior()
             if profiler is not None:
-                profiler.record_posterior_call()
                 profiler.record_posterior_phase(current_phase, used=True)
             selection_start = time.perf_counter()
             r, c = _choose_next_shot_for_strategy(
@@ -600,9 +603,11 @@ def _simulate_model_game(
                 profiler=profiler,
             )
             if profiler is not None:
-                profiler.record_posterior_phase(current_phase, used=True)
                 sample_time = profiler.consume_last_sample_time()
                 profiler.record_selection(time.perf_counter() - selection_start, sample_time=sample_time)
+
+        if profiler is not None:
+            profiler.record_posterior_call()
 
         idx = cell_index(r, c, board_size)
         is_hit = (used_mask >> idx) & 1
@@ -650,6 +655,9 @@ def _simulate_model_game(
 
     if profiler is not None:
         profiler.record_game()
+        if track_phases and _env_flag("SIM_DEBUG_STATS", False):
+            total_phase = sum(phase_counts.values()) if phase_counts else 0
+            assert total_phase == shots, "Phase counts must sum to shots in sim"
     return shots, phase_counts
 
 
