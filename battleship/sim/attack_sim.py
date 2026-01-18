@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import time
@@ -87,6 +88,8 @@ class SimProfiler:
         self.selection_ex_sample = 0.0
         self._last_sample_time = 0.0
         self.posterior_calls = 0
+        self.posterior_used_by_phase: Dict[str, int] = {}
+        self.posterior_skipped_by_phase: Dict[str, int] = {}
 
     def record_layout_time(self, dt: float) -> None:
         self.layout_time += float(dt)
@@ -113,6 +116,11 @@ class SimProfiler:
 
     def record_posterior_call(self) -> None:
         self.posterior_calls += 1
+
+    def record_posterior_phase(self, phase: Optional[str], used: bool) -> None:
+        key = phase or "unknown"
+        target = self.posterior_used_by_phase if used else self.posterior_skipped_by_phase
+        target[key] = int(target.get(key, 0)) + 1
 
     def record_topup(
         self,
@@ -178,6 +186,8 @@ class SimProfiler:
             f"topup_reason_empty={self.topup_reason_empty}, "
             f"topup_reason_strategy_requires_full={self.topup_reason_strategy_full}\n"
             f"  posterior_calls={self.posterior_calls} ({posterior_per_shot:.2f}/shot)\n"
+            f"  posterior_used_by_phase={self.posterior_used_by_phase}\n"
+            f"  posterior_skipped_by_phase={self.posterior_skipped_by_phase}\n"
             f"  filter_time={self.filter_time:.4f}s ({avg_filter:.6f}s/shot), "
             f"avg_worlds_before_filter={avg_worlds_before:.1f}, "
             f"avg_worlds_after_filter={avg_worlds_after:.1f}, "
@@ -268,10 +278,12 @@ class WorldCache:
         assigned_hits: Dict[str, set],
         rng: random.Random,
         target_worlds: int,
+        max_attempts_factor: Optional[int] = None,
         profiler: Optional[SimProfiler] = None,
-    ) -> int:
+    ) -> Tuple[int, int, int]:
         existing_union = self.unions if self.unions else None
         existing_masks = self.ship_masks if self.ship_masks else None
+        seed_count = len(existing_union) if existing_union is not None else 0
         sample_start = time.perf_counter()
         worlds_union, worlds_ship_masks, _, _, N = sample_worlds(
             board,
@@ -282,6 +294,7 @@ class WorldCache:
             rng_seed=rng.randint(0, 2 ** 31 - 1),
             board_size=self.board_size,
             target_worlds=target_worlds,
+            max_attempts_factor=max_attempts_factor,
             existing_union=existing_union,
             existing_ship_masks=existing_masks,
             return_ship_masks=True,
@@ -299,7 +312,7 @@ class WorldCache:
             self.ship_masks.append(ship_masks_tuple)
             self._update_counts(union_mask, +1)
             added += 1
-        return added
+        return added, N, seed_count
 
     def posterior(self) -> Posterior:
         return Posterior(self.unions, self.cell_hit_counts, len(self.unions))
@@ -362,6 +375,7 @@ def _simulate_model_game(
     ship_index = {s: i for i, s in enumerate(ship_ids)}
     hit_mask = 0
     miss_mask = 0
+    log_rng = random.Random()
 
     fast_mode = _env_flag("SIM_FAST_MODE", True)
     base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
@@ -408,7 +422,41 @@ def _simulate_model_game(
             )
 
         # Pass our "God Mode" knowledge into the bot
-        if fast_mode and world_cache is not None:
+        skip_posterior = False
+        if strategy == "random":
+            skip_posterior = True
+        elif strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
+            if not any(board[r][c] == HIT for r in range(board_size) for c in range(board_size)):
+                skip_posterior = True
+
+        if skip_posterior:
+            unknown_cells = [
+                (r, c)
+                for r in range(board_size)
+                for c in range(board_size)
+                if board[r][c] == EMPTY
+            ]
+            if not unknown_cells:
+                r, c = 0, 0
+            elif strategy == "random":
+                r, c = rng.choice(unknown_cells)
+            elif strategy == "systematic_checkerboard":
+                sorted_cells = sorted(unknown_cells, key=lambda p: (p[0], p[1]))
+                whites = [p for p in sorted_cells if (p[0] + p[1]) % 2 == 0]
+                r, c = whites[0] if whites else sorted_cells[0]
+            elif strategy == "diagonal_stripe":
+                diagonals = [p for p in unknown_cells if (p[0] - p[1]) % 4 == 0]
+                if diagonals:
+                    r, c = rng.choice(diagonals)
+                else:
+                    secondary = [p for p in unknown_cells if (p[0] - p[1]) % 2 == 0]
+                    r, c = rng.choice(secondary) if secondary else rng.choice(unknown_cells)
+            else:
+                whites = [p for p in unknown_cells if (p[0] + p[1]) % 2 == 0]
+                r, c = rng.choice(whites) if whites else rng.choice(unknown_cells)
+            if profiler is not None:
+                profiler.record_posterior_phase(current_phase, used=False)
+        elif fast_mode and world_cache is not None:
             min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
             if env_min_keep is not None:
                 min_keep = _env_int("SIM_MIN_KEEP", min_keep)
@@ -425,6 +473,7 @@ def _simulate_model_game(
             if batch_size <= 0:
                 batch_size = 1000
 
+            n_before_filter = world_cache.size
             world_cache.filter_in_place(
                 miss_mask,
                 assigned_hit_masks,
@@ -432,6 +481,7 @@ def _simulate_model_game(
                 confirmed_sunk,
                 profiler=profiler,
             )
+            n_after_filter = world_cache.size
             if world_cache.size == 0:
                 world_cache.clear()
             if world_cache.size < min_keep:
@@ -444,9 +494,13 @@ def _simulate_model_game(
                         reason_strategy_full=_is_heavy_strategy(strategy),
                     )
                 loops = 0
-                while world_cache.size < topup_to and loops < 10:
+                start_size = world_cache.size
+                remaining = max(0, topup_to - start_size)
+                max_loops = max(3, int(math.ceil(remaining / max(1, batch_size))) + 5)
+                last_added = None
+                while world_cache.size < topup_to and loops < max_loops:
                     desired = min(world_cache.size + batch_size, topup_to)
-                    added = world_cache.top_up(
+                    added, n_returned, seed_count = world_cache.top_up(
                         board,
                         sim_placements,
                         ship_ids,
@@ -454,14 +508,33 @@ def _simulate_model_game(
                         assigned_hits,
                         rng,
                         target_worlds=desired,
+                        max_attempts_factor=None,
                         profiler=profiler,
                     )
+                    if profiler is not None and log_rng.random() < 0.01:
+                        print(
+                            "[SIM_PROFILE_DETAIL] topup",
+                            f"N_before_filter={n_before_filter}",
+                            f"N_after_filter={n_after_filter}",
+                            f"N_before_topup={start_size}",
+                            f"MIN_KEEP={min_keep}",
+                            f"TOPUP_TO={topup_to}",
+                            f"target_worlds={desired}",
+                            "max_attempts_factor=default",
+                            f"existing_empty={seed_count == 0}",
+                            f"N_returned={n_returned}",
+                            f"num_added={added}",
+                            f"seed_count={seed_count}",
+                            f"seen_union_size={len(world_cache._seen)}",
+                        )
                     loops += 1
+                    last_added = added
                     if added <= 0:
                         break
             posterior = world_cache.posterior()
             if profiler is not None:
                 profiler.record_posterior_call()
+                profiler.record_posterior_phase(current_phase, used=True)
             selection_start = time.perf_counter()
             r, c = _choose_next_shot_for_strategy(
                 strategy,
@@ -492,6 +565,7 @@ def _simulate_model_game(
                 profiler=profiler,
             )
             if profiler is not None:
+                profiler.record_posterior_phase(current_phase, used=True)
                 sample_time = profiler.consume_last_sample_time()
                 profiler.record_selection(time.perf_counter() - selection_start, sample_time=sample_time)
 
