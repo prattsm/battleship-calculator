@@ -147,6 +147,23 @@ def _choose_next_shot_for_strategy(
     if strategy == "random":
         return rng.choice(unknown_cells)
 
+    has_any_hit = any(board[r][c] == HIT for r in range(board_size) for c in range(board_size))
+    if not has_any_hit and strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
+        if strategy == "random_checkerboard":
+            whites = [(r, c) for (r, c) in unknown_cells if (r + c) % 2 == 0]
+            return rng.choice(whites) if whites else rng.choice(unknown_cells)
+        if strategy == "systematic_checkerboard":
+            sorted_cells = sorted(unknown_cells, key=lambda p: (p[0], p[1]))
+            whites = [p for p in sorted_cells if (p[0] + p[1]) % 2 == 0]
+            return whites[0] if whites else sorted_cells[0]
+        diagonals = [p for p in unknown_cells if (p[0] - p[1]) % 4 == 0]
+        if diagonals:
+            return rng.choice(diagonals)
+        secondary = [p for p in unknown_cells if (p[0] - p[1]) % 2 == 0]
+        if secondary:
+            return rng.choice(secondary)
+        return rng.choice(unknown_cells)
+
     # 1) Build World Model
     confirmed_sunk = known_sunk if known_sunk is not None else set()
     assigned_hits = known_assigned if known_assigned is not None else {s: set() for s in ship_ids}
@@ -180,7 +197,6 @@ def _choose_next_shot_for_strategy(
 
     # --- TARGET MODE LOGIC (Refined) ---
     # Only enter target mode if we have *any* hit on the board and the posterior is confident.
-    has_any_hit = any(board[r][c] == HIT for r in range(board_size) for c in range(board_size))
     max_p = max(cell_probs[cell_index(r, c, board_size)] for r, c in unknown_cells) if unknown_cells else 0.0
     is_target_mode = has_any_hit and (max_p > 0.30)
 

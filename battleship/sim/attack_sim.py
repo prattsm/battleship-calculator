@@ -28,6 +28,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _target_worlds_for_strategy(strategy: str, base_target: int) -> int:
+    adaptive = _env_flag("SIM_ADAPTIVE_TARGETS", True)
+    if not adaptive:
+        return base_target
+    heavy = {"rollout_mcts", "two_ply"}
+    medium = {"entropy1", "hybrid_phase", "endpoint_phase", "thompson_world"}
+    if strategy in heavy:
+        return base_target
+    if strategy in medium:
+        return max(2000, min(base_target, 8000))
+    return max(1000, min(base_target, 5000))
+
+
 class SimProfiler:
     def __init__(self) -> None:
         self.reset()
@@ -278,11 +291,14 @@ def _simulate_model_game(
     miss_mask = 0
 
     fast_mode = _env_flag("SIM_FAST_MODE", True)
-    target_worlds = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
+    base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
+    target_worlds = _target_worlds_for_strategy(strategy, base_target)
     min_keep = _env_int("SIM_MIN_KEEP", max(1, target_worlds // 5))
     if min_keep > target_worlds:
         min_keep = target_worlds
     world_cache = WorldCache(ship_ids, board_size) if fast_mode else None
+    sim_placements = placements
+    frozen_ships: set[str] = set()
 
     # Track which cells belong to which ship for fast lookup
     cell_to_ship = {}
@@ -324,7 +340,7 @@ def _simulate_model_game(
             if world_cache.size < min_keep:
                 world_cache.top_up(
                     board,
-                    placements,
+                    sim_placements,
                     ship_ids,
                     confirmed_sunk,
                     assigned_hits,
@@ -337,7 +353,7 @@ def _simulate_model_game(
             r, c = _choose_next_shot_for_strategy(
                 strategy,
                 board,
-                placements,
+                sim_placements,
                 rng,
                 ship_ids,
                 board_size,
@@ -353,7 +369,7 @@ def _simulate_model_game(
             r, c = _choose_next_shot_for_strategy(
                 strategy,
                 board,
-                placements,
+                sim_placements,
                 rng,
                 ship_ids,
                 board_size,
@@ -397,6 +413,15 @@ def _simulate_model_game(
             if is_sunk and hit_ship not in confirmed_sunk:
                 confirmed_sunk.add(hit_ship)
                 ships_remaining -= 1
+                ship_idx = ship_index.get(hit_ship)
+                if ship_idx is not None:
+                    assigned_hits[hit_ship] = set(true_layout[hit_ship].cells)
+                    assigned_hit_masks[ship_idx] = true_layout[hit_ship].mask
+                if hit_ship not in frozen_ships:
+                    if sim_placements is placements:
+                        sim_placements = dict(placements)
+                    sim_placements[hit_ship] = [true_layout[hit_ship]]
+                    frozen_ships.add(hit_ship)
 
     if profiler is not None:
         profiler.record_game()
