@@ -1,11 +1,15 @@
+import concurrent.futures
+import hashlib
 import itertools
 import json
 import math
+import multiprocessing as mp
 import os
 import random
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -21,6 +25,102 @@ from battleship.utils.debug import debug_event
 
 PHASES = [PHASE_HUNT, PHASE_TARGET, PHASE_ENDGAME]
 
+_G_PLACEMENTS = None
+_G_SHIP_IDS: Optional[List[str]] = None
+_G_BOARD_SIZE: Optional[int] = None
+_G_TOTAL_CELLS: Optional[int] = None
+
+
+def _worker_init(placements, ship_ids, board_size: int, total_cells: int) -> None:
+    global _G_PLACEMENTS, _G_SHIP_IDS, _G_BOARD_SIZE, _G_TOTAL_CELLS
+    _G_PLACEMENTS = placements
+    _G_SHIP_IDS = list(ship_ids)
+    _G_BOARD_SIZE = int(board_size)
+    _G_TOTAL_CELLS = int(total_cells)
+
+
+def _blank_stats_dict(total_cells: int) -> Dict[str, object]:
+    return {
+        "total_games": 0,
+        "total_shots": 0.0,
+        "sum_sq_shots": 0.0,
+        "min_shots": 0,
+        "max_shots": 0,
+        "hist": [0] * (total_cells + 1),
+        "phase": {
+            phase: {
+                "total_games": 0,
+                "total_shots": 0.0,
+                "sum_sq_shots": 0.0,
+                "hist": [0] * (total_cells + 1),
+            }
+            for phase in PHASES
+        },
+    }
+
+
+def _stable_seed(global_seed: int, model_key: str, game_index: int) -> int:
+    payload = f"{int(global_seed)}|{model_key}|{int(game_index)}".encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, "little") & 0x7FFFFFFF
+
+
+def _simulate_chunk(model_key: str, start_idx: int, n_games: int, global_seed: int) -> Tuple[str, Dict[str, object], int]:
+    if _G_PLACEMENTS is None or _G_SHIP_IDS is None or _G_BOARD_SIZE is None or _G_TOTAL_CELLS is None:
+        raise RuntimeError("worker not initialized")
+    stats = _blank_stats_dict(_G_TOTAL_CELLS)
+    for i in range(n_games):
+        seed = _stable_seed(global_seed, model_key, start_idx + i)
+        rng = random.Random(seed)
+        shots, phase_counts = simulate_model_game_with_phases(
+            model_key,
+            _G_PLACEMENTS,
+            _G_SHIP_IDS,
+            _G_BOARD_SIZE,
+            rng,
+        )
+        if _sim_debug_stats_enabled() and phase_counts:
+            assert sum(phase_counts.values()) == shots, "Phase counts must sum to shots"
+        stats["total_games"] = int(stats.get("total_games", 0)) + 1
+        stats["total_shots"] = float(stats.get("total_shots", 0.0)) + shots
+        stats["sum_sq_shots"] = float(stats.get("sum_sq_shots", 0.0)) + (shots * shots)
+
+        if stats["total_games"] == 1:
+            stats["min_shots"] = shots
+            stats["max_shots"] = shots
+        else:
+            stats["min_shots"] = min(int(stats.get("min_shots", shots)), shots)
+            stats["max_shots"] = max(int(stats.get("max_shots", shots)), shots)
+
+        hist = stats.get("hist")
+        if not isinstance(hist, list) or len(hist) < _G_TOTAL_CELLS + 1:
+            hist = [0] * (_G_TOTAL_CELLS + 1)
+        if 0 <= shots < len(hist):
+            hist[shots] += 1
+        else:
+            hist[-1] += 1
+        stats["hist"] = hist
+
+        if phase_counts:
+            phase_stats = stats.get("phase")
+            if not isinstance(phase_stats, dict):
+                phase_stats = _blank_stats_dict(_G_TOTAL_CELLS).get("phase", {})
+            for phase in PHASES:
+                phase_shots = int(phase_counts.get(phase, 0))
+                entry = phase_stats.get(phase, {})
+                entry["total_games"] = int(entry.get("total_games", 0)) + 1
+                entry["total_shots"] = float(entry.get("total_shots", 0.0)) + phase_shots
+                entry["sum_sq_shots"] = float(entry.get("sum_sq_shots", 0.0)) + (phase_shots * phase_shots)
+                phist = entry.get("hist")
+                if not isinstance(phist, list):
+                    phist = [0] * (_G_TOTAL_CELLS + 1)
+                idx = phase_shots if 0 <= phase_shots < len(phist) else len(phist) - 1
+                phist[idx] += 1
+                entry["hist"] = phist
+                phase_stats[phase] = entry
+            stats["phase"] = phase_stats
+    return model_key, stats, n_games
+
 
 def _sim_profile_enabled() -> bool:
     raw = os.getenv("SIM_PROFILE")
@@ -34,6 +134,65 @@ def _sim_debug_stats_enabled() -> bool:
     if raw is None:
         return False
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+        return value
+    except ValueError:
+        return default
+
+
+def _multiproc_mode() -> str:
+    raw = os.getenv("SIM_MULTIPROC")
+    if raw is None:
+        return "auto"
+    val = str(raw).strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return "on"
+    if val in {"0", "false", "no", "off"}:
+        return "off"
+    return "auto"
+
+
+def _default_worker_count() -> int:
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    if cpu == 4:
+        return 2
+    return max(1, cpu - 2)
+
+
+def _resolve_workers() -> int:
+    cpu = os.cpu_count() or 1
+    workers = _default_worker_count()
+    raw = os.getenv("SIM_WORKERS")
+    if raw is not None:
+        try:
+            workers = int(raw)
+        except ValueError:
+            workers = _default_worker_count()
+    workers = max(1, min(workers, cpu))
+    workers = min(workers, 12)
+    return workers
+
+
+def _resolve_chunk_games() -> Tuple[int, bool]:
+    raw = os.getenv("SIM_CHUNK_GAMES")
+    if raw is None:
+        return 25, False
+    if str(raw).strip().lower() == "auto":
+        return 25, True
+    try:
+        value = int(raw)
+        return max(1, value), False
+    except ValueError:
+        return 25, False
 
 
 def _hist_percentile(hist: List[int], pct: float) -> int:
@@ -756,7 +915,7 @@ class ModelStatsTab(QtWidgets.QWidget):
             candidates = [self.model_defs[idx - 1]["key"]]
 
         # Calculate actual work needed (top-up to target)
-        work_order = {}  # key -> games_to_run
+        work_plan: Dict[str, Dict[str, int]] = {}  # key -> {"start": current_games, "count": needed}
         total_jobs = 0
 
         for key in candidates:
@@ -767,10 +926,10 @@ class ModelStatsTab(QtWidgets.QWidget):
                 continue
             needed = target_games - current_games
             if needed > 0:
-                work_order[key] = needed
+                work_plan[key] = {"start": current_games, "count": needed}
                 total_jobs += needed
 
-        self._active_sim_keys = list(work_order.keys())
+        self._active_sim_keys = list(work_plan.keys())
 
         if total_jobs == 0:
             QtWidgets.QMessageBox.information(
@@ -791,7 +950,7 @@ class ModelStatsTab(QtWidgets.QWidget):
 
         self._sim_thread = QtCore.QThread(self)
         # Pass the calculated work_order instead of raw numbers
-        self._sim_worker = SimulationWorker(work_order, self.placements, self.ship_ids, self.board_size)
+        self._sim_worker = SimulationWorker(work_plan, self.placements, self.ship_ids, self.board_size)
         self._sim_worker.moveToThread(self._sim_thread)
 
         self._sim_thread.started.connect(self._sim_worker.run)
@@ -910,13 +1069,13 @@ class SimulationWorker(QtCore.QObject):
 
     def __init__(
         self,
-        work_order: Dict[str, int],  # Map: "greedy" -> 500 more games
+        work_plan: Dict[str, Dict[str, int]],  # Map: key -> {"start": idx, "count": n}
         placements: Dict[str, List[object]],
         ship_ids: List[str],
         board_size: int,
     ):
         super().__init__()
-        self.work_order = work_order
+        self.work_plan = work_plan
         self.placements = placements
         self.ship_ids = list(ship_ids)
         self.board_size = int(board_size)
@@ -963,21 +1122,117 @@ class SimulationWorker(QtCore.QObject):
                     level="warning",
                 )
 
+    def _merge_stats_in_place(self, base: Dict[str, object], delta: Dict[str, object]) -> None:
+        dg = int(delta.get("total_games", 0))
+        if dg <= 0:
+            return
+        base_g = int(base.get("total_games", 0))
+        base_s = float(base.get("total_shots", 0.0))
+        base_sq = float(base.get("sum_sq_shots", 0.0))
+        base_min = int(base.get("min_shots", 0))
+        base_max = int(base.get("max_shots", 0))
+        base_hist = base.get("hist")
+        if not isinstance(base_hist, list) or len(base_hist) < self.total_cells + 1:
+            base_hist = [0] * (self.total_cells + 1)
+
+        dg_s = float(delta.get("total_shots", 0.0))
+        dg_sq = float(delta.get("sum_sq_shots", 0.0))
+        dg_min = int(delta.get("min_shots", base_min))
+        dg_max = int(delta.get("max_shots", base_max))
+        dg_hist = delta.get("hist") or [0] * (self.total_cells + 1)
+
+        new_g = base_g + dg
+        new_s = base_s + dg_s
+        new_sq = base_sq + dg_sq
+
+        if base_g == 0:
+            new_min = dg_min
+            new_max = dg_max
+        else:
+            new_min = min(base_min, dg_min)
+            new_max = max(base_max, dg_max)
+
+        merged_hist = [0] * max(len(base_hist), len(dg_hist))
+        for i in range(len(merged_hist)):
+            merged_hist[i] = (base_hist[i] if i < len(base_hist) else 0) + (dg_hist[i] if i < len(dg_hist) else 0)
+
+        base["total_games"] = new_g
+        base["total_shots"] = new_s
+        base["sum_sq_shots"] = new_sq
+        base["min_shots"] = new_min
+        base["max_shots"] = new_max
+        base["hist"] = merged_hist
+
+        delta_phase = delta.get("phase")
+        if isinstance(delta_phase, dict):
+            base_phase = base.get("phase")
+            if not isinstance(base_phase, dict):
+                base_phase = self._blank_stats().get("phase", {})
+            for phase in PHASES:
+                d = delta_phase.get(phase)
+                if not isinstance(d, dict):
+                    continue
+                c = base_phase.get(phase, {})
+                if not isinstance(c, dict):
+                    c = {"total_games": 0, "total_shots": 0.0, "sum_sq_shots": 0.0, "hist": [0] * (self.total_cells + 1)}
+
+                c_games = int(c.get("total_games", 0))
+                c_total = float(c.get("total_shots", 0.0))
+                c_sq = float(c.get("sum_sq_shots", 0.0))
+                c_hist = c.get("hist") or [0] * (self.total_cells + 1)
+
+                d_games = int(d.get("total_games", 0))
+                d_total = float(d.get("total_shots", 0.0))
+                d_sq = float(d.get("sum_sq_shots", 0.0))
+                d_hist = d.get("hist") or [0] * (self.total_cells + 1)
+
+                merged_phist = [0] * max(len(c_hist), len(d_hist))
+                for i in range(len(merged_phist)):
+                    merged_phist[i] = (c_hist[i] if i < len(c_hist) else 0) + (d_hist[i] if i < len(d_hist) else 0)
+
+                c["total_games"] = c_games + d_games
+                c["total_shots"] = c_total + d_total
+                c["sum_sq_shots"] = c_sq + d_sq
+                c["hist"] = merged_phist
+                base_phase[phase] = c
+            base["phase"] = base_phase
+
     @QtCore.pyqtSlot()
     def run(self):
-        rng = random.Random()
-        total_jobs = sum(self.work_order.values())
+        total_jobs = sum(int(v.get("count", 0)) for v in self.work_plan.values())
         if total_jobs == 0:
             self.finished.emit({})
             return
 
+        mode = _multiproc_mode()
+        cpu = os.cpu_count() or 1
+        enable_mp = False
+        if mode == "on":
+            enable_mp = True
+        elif mode == "auto" and cpu >= 4:
+            enable_mp = True
+
+        if enable_mp:
+            try:
+                self._run_multiproc(total_jobs)
+                return
+            except Exception as exc:
+                debug_event(
+                    None,
+                    "ModelStats Debug",
+                    f"multiproc_failed_fallback reason={exc}",
+                    level="warning",
+                )
+        self._run_sequential(total_jobs)
+
+    def _run_sequential(self, total_jobs: int) -> None:
+        rng = random.Random()
         profile_enabled = _sim_profile_enabled()
         profilers: Dict[str, SimProfiler] = {}
         if profile_enabled:
-            for key in self.work_order.keys():
+            for key in self.work_plan.keys():
                 profilers[key] = SimProfiler()
 
-        # NEW: Update roughly every 1% or every 1 game, whichever is larger
         update_interval = max(1, total_jobs // 100)
         checkpoint_interval = max(1, total_jobs // 20)
 
@@ -985,14 +1240,24 @@ class SimulationWorker(QtCore.QObject):
         pending: Dict[str, Dict[str, object]] = {}
         last_checkpoint_done = 0
 
-        for key, num_to_run in self.work_order.items():
+        global_seed = _env_int("SIM_GLOBAL_SEED", 1337)
+        deterministic = _multiproc_mode() != "off" or os.getenv("SIM_GLOBAL_SEED") is not None
+
+        for key, plan in self.work_plan.items():
+            count = int(plan.get("count", 0))
+            start_index = int(plan.get("start", 0))
+            if count <= 0:
+                continue
             if key not in pending:
                 pending[key] = self._blank_stats()
             stats = pending[key]
 
-            for _ in range(num_to_run):
+            for i in range(count):
                 if self._cancelled:
                     break
+                if deterministic:
+                    seed = _stable_seed(global_seed, key, start_index + i)
+                    rng = random.Random(seed)
                 shots, phase_counts = simulate_model_game_with_phases(
                     key,
                     self.placements,
@@ -1044,7 +1309,6 @@ class SimulationWorker(QtCore.QObject):
                     stats["phase"] = phase_stats
 
                 done += 1
-                # NEW: Smoother progress emission
                 if done % update_interval == 0 or done == total_jobs:
                     self.progress.emit(done, total_jobs)
                 if done - last_checkpoint_done >= checkpoint_interval:
@@ -1064,7 +1328,6 @@ class SimulationWorker(QtCore.QObject):
                                     f"checkpoint_emit model={k} games={games} "
                                     f"stats_id={id(pending.get(k))}",
                                 )
-                            # Validate current stats reference after reset.
                             if key in pending and id(stats) != id(pending[key]):
                                 debug_event(
                                     None,
@@ -1084,6 +1347,129 @@ class SimulationWorker(QtCore.QObject):
                 summary = profilers[key].format_summary(f"model={key}")
                 print(summary)
                 profilers[key].reset()
+
+        final_payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
+        if final_payload:
+            import copy
+            safe_final = {k: copy.deepcopy(v) for k, v in final_payload.items()}
+            self.finished.emit(safe_final)
+        else:
+            self.finished.emit({})
+
+    def _run_multiproc(self, total_jobs: int) -> None:
+        workers = _resolve_workers()
+        if workers <= 1:
+            self._run_sequential(total_jobs)
+            return
+
+        chunk_games, chunk_auto = _resolve_chunk_games()
+        max_in_flight = max(1, workers * 2)
+        global_seed = _env_int("SIM_GLOBAL_SEED", 1337)
+
+        pending: Dict[str, Dict[str, object]] = {}
+        for key in self.work_plan.keys():
+            pending[key] = self._blank_stats()
+
+        remaining: Dict[str, Dict[str, int]] = {}
+        for key, plan in self.work_plan.items():
+            remaining[key] = {
+                "next": int(plan.get("start", 0)),
+                "remaining": int(plan.get("count", 0)),
+            }
+
+        queue: Deque[str] = deque()
+        for key, plan in self.work_plan.items():
+            if int(plan.get("count", 0)) > 0:
+                queue.append(key)
+
+        submit_times: Dict[concurrent.futures.Future, float] = {}
+        in_flight: Dict[concurrent.futures.Future, Tuple[str, int]] = {}
+        done = 0
+        last_checkpoint = time.time()
+        update_interval = max(1, total_jobs // 100)
+        timing_games = 0
+        timing_seconds = 0.0
+
+        ctx = mp.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_worker_init,
+            initargs=(self.placements, self.ship_ids, self.board_size, self.total_cells),
+        ) as pool:
+            def submit_next() -> None:
+                nonlocal chunk_games
+                if not queue:
+                    return
+                key = queue.popleft()
+                plan = remaining.get(key)
+                if not plan or plan["remaining"] <= 0:
+                    return
+                n = min(chunk_games, plan["remaining"])
+                start_idx = plan["next"]
+                plan["next"] += n
+                plan["remaining"] -= n
+                fut = pool.submit(_simulate_chunk, key, start_idx, n, global_seed)
+                in_flight[fut] = (key, n)
+                submit_times[fut] = time.time()
+                if plan["remaining"] > 0:
+                    queue.append(key)
+
+            while len(in_flight) < max_in_flight and queue and not self._cancelled:
+                submit_next()
+
+            while in_flight:
+                if self._cancelled:
+                    for fut in list(in_flight.keys()):
+                        fut.cancel()
+                    # Let running tasks finish and merge them.
+                done_futs, _ = concurrent.futures.wait(
+                    in_flight.keys(),
+                    timeout=0.1,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done_futs:
+                    key, n = in_flight.pop(fut, ("", 0))
+                    start_time = submit_times.pop(fut, None)
+                    try:
+                        model_key, delta, games_done = fut.result()
+                    except Exception as exc:
+                        debug_event(None, "ModelStats Debug", f"chunk_failed model={key} err={exc}", level="warning")
+                        games_done = 0
+                        delta = None
+                        model_key = key
+                    if games_done > 0 and delta:
+                        self._merge_stats_in_place(pending[model_key], delta)
+                        done += games_done
+                        if start_time is not None:
+                            elapsed = max(0.0, time.time() - start_time)
+                            timing_seconds += elapsed
+                            timing_games += games_done
+                            if chunk_auto and timing_games > 0:
+                                sec_per_game = timing_seconds / max(1, timing_games)
+                                target_seconds = 1.0
+                                new_chunk = int(max(5, min(100, int(target_seconds / max(1e-6, sec_per_game)))))
+                                chunk_games = new_chunk
+                        if done % update_interval == 0 or done == total_jobs:
+                            self.progress.emit(done, total_jobs)
+
+                    now = time.time()
+                    if now - last_checkpoint >= 2.0:
+                        payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
+                        if payload:
+                            import copy
+                            safe_payload = {k: copy.deepcopy(v) for k, v in payload.items()}
+                            self.checkpoint.emit(safe_payload, done, total_jobs)
+                            for k in payload.keys():
+                                self._reset_stats_in_place(pending[k])
+                        last_checkpoint = now
+
+                    while len(in_flight) < max_in_flight and queue and not self._cancelled:
+                        submit_next()
+
+                if not in_flight and queue and not self._cancelled:
+                    while len(in_flight) < max_in_flight and queue and not self._cancelled:
+                        submit_next()
 
         final_payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
         if final_payload:
