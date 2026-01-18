@@ -29,6 +29,13 @@ def _sim_profile_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _sim_debug_stats_enabled() -> bool:
+    raw = os.getenv("SIM_DEBUG_STATS")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _hist_percentile(hist: List[int], pct: float) -> int:
     total = sum(hist)
     if total <= 0:
@@ -1031,6 +1038,23 @@ class SimulationWorker(QtCore.QObject):
                         self.checkpoint.emit(payload, done, total_jobs)
                         for k in payload.keys():
                             self._reset_stats_in_place(pending[k])
+                        if _sim_debug_stats_enabled():
+                            for k, v in payload.items():
+                                games = int(v.get("total_games", 0))
+                                debug_event(
+                                    None,
+                                    "ModelStats Debug",
+                                    f"checkpoint_emit model={k} games={games} "
+                                    f"stats_id={id(pending.get(k))}",
+                                )
+                            # Validate current stats reference after reset.
+                            if key in pending and id(stats) != id(pending[key]):
+                                debug_event(
+                                    None,
+                                    "ModelStats Debug",
+                                    f"stats_ref_mismatch model={key} stats_id={id(stats)} pending_id={id(pending[key])}",
+                                    level="warning",
+                                )
                         last_checkpoint_done = done
 
             if self._cancelled:
