@@ -28,17 +28,36 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _target_worlds_for_strategy(strategy: str, base_target: int) -> int:
-    adaptive = _env_flag("SIM_ADAPTIVE_TARGETS", True)
-    if not adaptive:
-        return base_target
-    heavy = {"rollout_mcts", "two_ply"}
-    medium = {"entropy1", "hybrid_phase", "endpoint_phase", "thompson_world"}
-    if strategy in heavy:
-        return base_target
-    if strategy in medium:
-        return max(2000, min(base_target, 8000))
-    return max(1000, min(base_target, 5000))
+def _is_heavy_strategy(strategy: str) -> bool:
+    return strategy in {"entropy1", "two_ply", "rollout_mcts"}
+
+
+def _default_topup_targets(
+    strategy: str,
+    phase: Optional[str],
+    base_target: int,
+) -> Tuple[int, int]:
+    if strategy == "hybrid_phase" and phase:
+        if phase == PHASE_HUNT:
+            min_keep = 800
+            topup_to = 6000
+        elif phase == PHASE_TARGET:
+            min_keep = 300
+            topup_to = 2500
+        else:
+            min_keep = 500
+            topup_to = 4000
+        topup_to = min(topup_to, base_target)
+        min_keep = min(min_keep, topup_to)
+        return min_keep, topup_to
+
+    min_keep = 700
+    if _is_heavy_strategy(strategy):
+        topup_to = min(base_target, 10000)
+    else:
+        topup_to = min(base_target, 5000)
+    min_keep = min(min_keep, topup_to)
+    return min_keep, topup_to
 
 
 class SimProfiler:
@@ -52,6 +71,14 @@ class SimProfiler:
         self.sample_time = 0.0
         self.sample_calls = 0
         self.topups = 0
+        self.topup_reason_lowN = 0
+        self.topup_reason_empty = 0
+        self.topup_reason_strategy_full = 0
+        self.topup_n_sum = 0
+        self.topup_events = 0
+        self.topup_gap_sum = 0
+        self.topup_gap_events = 0
+        self._last_topup_shot: Optional[int] = None
         self.filter_time = 0.0
         self.filter_events = 0
         self.worlds_before_filter = 0
@@ -67,8 +94,6 @@ class SimProfiler:
     def record_sample(self, dt: float, n_worlds: int, topup: bool = False) -> None:
         self.sample_time += float(dt)
         self.sample_calls += 1
-        if topup:
-            self.topups += 1
         self._last_sample_time = float(dt)
 
     def consume_last_sample_time(self) -> float:
@@ -88,6 +113,30 @@ class SimProfiler:
 
     def record_posterior_call(self) -> None:
         self.posterior_calls += 1
+
+    def record_topup(
+        self,
+        n_before: int,
+        current_shot: int,
+        reason_lowN: bool,
+        reason_empty: bool,
+        reason_strategy_full: bool,
+    ) -> None:
+        self.topups += 1
+        self.topup_events += 1
+        self.topup_n_sum += int(n_before)
+        if self._last_topup_shot is not None:
+            gap = int(current_shot) - int(self._last_topup_shot)
+            if gap >= 0:
+                self.topup_gap_sum += gap
+                self.topup_gap_events += 1
+        self._last_topup_shot = int(current_shot)
+        if reason_lowN:
+            self.topup_reason_lowN += 1
+        if reason_empty:
+            self.topup_reason_empty += 1
+        if reason_strategy_full:
+            self.topup_reason_strategy_full += 1
 
     def record_shot(self) -> None:
         self.shots += 1
@@ -111,6 +160,8 @@ class SimProfiler:
         )
         avg_calls = self.sample_calls / games
         avg_topups = self.topups / games
+        avg_topup_n = self.topup_n_sum / max(1, self.topup_events)
+        avg_topup_gap = self.topup_gap_sum / max(1, self.topup_gap_events)
         avg_layout = self.layout_time / games
         posterior_per_shot = self.posterior_calls / shots
         return (
@@ -120,7 +171,12 @@ class SimProfiler:
             f"  sample_time={self.sample_time:.4f}s "
             f"({avg_sample_per_game:.4f}s/game, {avg_sample_per_shot:.6f}s/shot)\n"
             f"  sample_calls={self.sample_calls} ({avg_calls:.2f}/game), "
-            f"topups={self.topups} ({avg_topups:.2f}/game)\n"
+            f"topups={self.topups} ({avg_topups:.2f}/game), "
+            f"avg_N_at_topup={avg_topup_n:.1f}, "
+            f"shots_between_topups={avg_topup_gap:.1f}\n"
+            f"  topup_reason_lowN={self.topup_reason_lowN}, "
+            f"topup_reason_empty={self.topup_reason_empty}, "
+            f"topup_reason_strategy_requires_full={self.topup_reason_strategy_full}\n"
             f"  posterior_calls={self.posterior_calls} ({posterior_per_shot:.2f}/shot)\n"
             f"  filter_time={self.filter_time:.4f}s ({avg_filter:.6f}s/shot), "
             f"avg_worlds_before_filter={avg_worlds_before:.1f}, "
@@ -309,17 +365,8 @@ def _simulate_model_game(
 
     fast_mode = _env_flag("SIM_FAST_MODE", True)
     base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
-    target_worlds = _target_worlds_for_strategy(strategy, base_target)
-    min_keep_default = max(500, target_worlds // 10)
-    min_keep = _env_int("SIM_MIN_KEEP", min_keep_default)
-    if min_keep > target_worlds:
-        min_keep = target_worlds
-    refill_default = min(4000, target_worlds)
-    refill_target = _env_int("SIM_REFILL_TARGET", refill_default)
-    if refill_target > target_worlds:
-        refill_target = target_worlds
-    if refill_target < min_keep:
-        refill_target = min_keep
+    env_min_keep = os.getenv("SIM_MIN_KEEP")
+    env_topup_to = os.getenv("SIM_TOPUP_TO") or os.getenv("SIM_REFILL_TARGET")
     world_cache = WorldCache(ship_ids, board_size) if fast_mode else None
     sim_placements = placements
     frozen_ships: set[str] = set()
@@ -340,6 +387,7 @@ def _simulate_model_game(
         phase_counts = {PHASE_HUNT: 0, PHASE_TARGET: 0, PHASE_ENDGAME: 0}
 
     while ships_remaining > 0 and shots < total_cells:
+        current_phase: Optional[str] = None
         if phase_counts is not None:
             phase = classify_phase(
                 board,
@@ -349,9 +397,34 @@ def _simulate_model_game(
                 board_size=board_size,
             )
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
+            current_phase = phase
+        elif strategy == "hybrid_phase":
+            current_phase = classify_phase(
+                board,
+                confirmed_sunk,
+                assigned_hits,
+                ship_ids,
+                board_size=board_size,
+            )
 
         # Pass our "God Mode" knowledge into the bot
         if fast_mode and world_cache is not None:
+            min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
+            if env_min_keep is not None:
+                min_keep = _env_int("SIM_MIN_KEEP", min_keep)
+            if env_topup_to is not None:
+                if os.getenv("SIM_TOPUP_TO") is not None:
+                    topup_to = _env_int("SIM_TOPUP_TO", topup_to)
+                else:
+                    topup_to = _env_int("SIM_REFILL_TARGET", topup_to)
+            if topup_to > base_target:
+                topup_to = base_target
+            if min_keep > topup_to:
+                min_keep = topup_to
+            batch_size = _env_int("SIM_TOPUP_BATCH", 1000)
+            if batch_size <= 0:
+                batch_size = 1000
+
             world_cache.filter_in_place(
                 miss_mask,
                 assigned_hit_masks,
@@ -362,16 +435,30 @@ def _simulate_model_game(
             if world_cache.size == 0:
                 world_cache.clear()
             if world_cache.size < min_keep:
-                world_cache.top_up(
-                    board,
-                    sim_placements,
-                    ship_ids,
-                    confirmed_sunk,
-                    assigned_hits,
-                    rng,
-                    target_worlds=refill_target,
-                    profiler=profiler,
-                )
+                if profiler is not None:
+                    profiler.record_topup(
+                        n_before=world_cache.size,
+                        current_shot=shots,
+                        reason_lowN=True,
+                        reason_empty=(world_cache.size == 0),
+                        reason_strategy_full=_is_heavy_strategy(strategy),
+                    )
+                loops = 0
+                while world_cache.size < topup_to and loops < 10:
+                    desired = min(world_cache.size + batch_size, topup_to)
+                    added = world_cache.top_up(
+                        board,
+                        sim_placements,
+                        ship_ids,
+                        confirmed_sunk,
+                        assigned_hits,
+                        rng,
+                        target_worlds=desired,
+                        profiler=profiler,
+                    )
+                    loops += 1
+                    if added <= 0:
+                        break
             posterior = world_cache.posterior()
             if profiler is not None:
                 profiler.record_posterior_call()
