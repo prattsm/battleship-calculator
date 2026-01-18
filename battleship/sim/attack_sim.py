@@ -1,4 +1,3 @@
-import math
 import os
 import random
 import time
@@ -7,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from battleship.domain.board import cell_index
 from battleship.domain.config import BOARD_SIZE, EMPTY, HIT, MISS, WORLD_SAMPLE_TARGET
 from battleship.domain.phase import PHASE_ENDGAME, PHASE_HUNT, PHASE_TARGET, classify_phase
-from battleship.domain.worlds import sample_worlds
+from battleship.domain.worlds import sample_worlds as _sample_worlds
 from battleship.strategies.selection import Posterior, _choose_next_shot_for_strategy
 
 
@@ -27,6 +26,37 @@ def _env_int(name: str, default: int) -> int:
         return value if value > 0 else default
     except ValueError:
         return default
+
+
+_SAMPLE_TRACE_LIMIT = 50
+_sample_trace_count = 0
+_sample_trace_enabled = False
+
+
+def _sample_worlds_with_trace(*args, **kwargs):
+    global _sample_trace_count
+    result = _sample_worlds(*args, **kwargs)
+    if _sample_trace_enabled and _sample_trace_count < _SAMPLE_TRACE_LIMIT:
+        try:
+            import inspect
+
+            frame = inspect.currentframe()
+            caller = frame.f_back if frame else None
+            if caller is not None:
+                info = inspect.getframeinfo(caller)
+                print(
+                    "[SIM_PROFILE_CALLSITE]",
+                    f"{os.path.basename(info.filename)}:{info.function}",
+                )
+        except Exception:
+            pass
+        _sample_trace_count += 1
+    return result
+
+
+def _enable_sample_trace(enable: bool) -> None:
+    global _sample_trace_enabled
+    _sample_trace_enabled = bool(enable)
 
 
 def _is_heavy_strategy(strategy: str) -> bool:
@@ -206,6 +236,8 @@ class WorldCache:
         self.ship_masks: List[Tuple[int, ...]] = []
         self.cell_hit_counts: List[int] = [0] * self.total_cells
         self._seen: set[int] = set()
+        self.saturated = False
+        self.saturated_N = 0
 
     @property
     def size(self) -> int:
@@ -216,6 +248,8 @@ class WorldCache:
         self.ship_masks = []
         self.cell_hit_counts = [0] * self.total_cells
         self._seen = set()
+        self.saturated = False
+        self.saturated_N = 0
 
     def _update_counts(self, union_mask: int, delta: int) -> None:
         m = union_mask
@@ -234,6 +268,8 @@ class WorldCache:
         confirmed_sunk: set,
         profiler: Optional[SimProfiler] = None,
     ) -> int:
+        if len(assigned_hit_masks) != len(self.ship_ids):
+            raise AssertionError("assigned_hit_masks length mismatch for WorldCache")
         if not self.unions:
             if profiler is not None:
                 profiler.record_filter(0.0, 0, 0)
@@ -253,10 +289,6 @@ class WorldCache:
                 if req_mask and (req_mask & ~ship_masks_tuple[i]) != 0:
                     ok = False
                     break
-                if confirmed_sunk and (self.ship_ids[i] in confirmed_sunk):
-                    if (ship_masks_tuple[i] & ~hit_mask) != 0:
-                        ok = False
-                        break
             if ok:
                 filtered_union.append(union_mask)
                 filtered_masks.append(ship_masks_tuple)
@@ -281,11 +313,13 @@ class WorldCache:
         max_attempts_factor: Optional[int] = None,
         profiler: Optional[SimProfiler] = None,
     ) -> Tuple[int, int, int]:
+        if tuple(ship_ids) != tuple(self.ship_ids):
+            raise AssertionError("ship_ids mismatch for WorldCache")
         existing_union = self.unions if self.unions else None
         existing_masks = self.ship_masks if self.ship_masks else None
         seed_count = len(existing_union) if existing_union is not None else 0
         sample_start = time.perf_counter()
-        worlds_union, worlds_ship_masks, _, _, N = sample_worlds(
+        worlds_union, worlds_ship_masks, _, _, N = _sample_worlds_with_trace(
             board,
             placements,
             ship_ids,
@@ -312,6 +346,9 @@ class WorldCache:
             self.ship_masks.append(ship_masks_tuple)
             self._update_counts(union_mask, +1)
             added += 1
+        if added <= 0 or N <= seed_count:
+            self.saturated = True
+            self.saturated_N = len(self.unions)
         return added, N, seed_count
 
     def posterior(self) -> Posterior:
@@ -376,6 +413,14 @@ def _simulate_model_game(
     hit_mask = 0
     miss_mask = 0
     log_rng = random.Random()
+    if _env_flag("SIM_TRACE_SAMPLE_CALLS", False):
+        _enable_sample_trace(True)
+        try:
+            from battleship.strategies import selection as _selection
+
+            _selection.sample_worlds = _sample_worlds_with_trace
+        except Exception:
+            pass
 
     fast_mode = _env_flag("SIM_FAST_MODE", True)
     base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
@@ -469,10 +514,6 @@ def _simulate_model_game(
                 topup_to = base_target
             if min_keep > topup_to:
                 min_keep = topup_to
-            batch_size = _env_int("SIM_TOPUP_BATCH", 1000)
-            if batch_size <= 0:
-                batch_size = 1000
-
             n_before_filter = world_cache.size
             world_cache.filter_in_place(
                 miss_mask,
@@ -484,7 +525,10 @@ def _simulate_model_game(
             n_after_filter = world_cache.size
             if world_cache.size == 0:
                 world_cache.clear()
-            if world_cache.size < min_keep:
+            if world_cache.saturated:
+                if profiler is not None:
+                    profiler.record_posterior_phase(current_phase, used=True)
+            elif world_cache.size < min_keep:
                 if profiler is not None:
                     profiler.record_topup(
                         n_before=world_cache.size,
@@ -493,44 +537,35 @@ def _simulate_model_game(
                         reason_empty=(world_cache.size == 0),
                         reason_strategy_full=_is_heavy_strategy(strategy),
                     )
-                loops = 0
                 start_size = world_cache.size
-                remaining = max(0, topup_to - start_size)
-                max_loops = max(3, int(math.ceil(remaining / max(1, batch_size))) + 5)
-                last_added = None
-                while world_cache.size < topup_to and loops < max_loops:
-                    desired = min(world_cache.size + batch_size, topup_to)
-                    added, n_returned, seed_count = world_cache.top_up(
-                        board,
-                        sim_placements,
-                        ship_ids,
-                        confirmed_sunk,
-                        assigned_hits,
-                        rng,
-                        target_worlds=desired,
-                        max_attempts_factor=None,
-                        profiler=profiler,
+                desired = topup_to
+                added, n_returned, seed_count = world_cache.top_up(
+                    board,
+                    sim_placements,
+                    ship_ids,
+                    confirmed_sunk,
+                    assigned_hits,
+                    rng,
+                    target_worlds=desired,
+                    max_attempts_factor=None,
+                    profiler=profiler,
+                )
+                if profiler is not None and log_rng.random() < 0.01:
+                    print(
+                        "[SIM_PROFILE_DETAIL] topup",
+                        f"N_before_filter={n_before_filter}",
+                        f"N_after_filter={n_after_filter}",
+                        f"N_before_topup={start_size}",
+                        f"MIN_KEEP={min_keep}",
+                        f"TOPUP_TO={topup_to}",
+                        f"target_worlds={desired}",
+                        "max_attempts_factor=default",
+                        f"existing_empty={seed_count == 0}",
+                        f"N_returned={n_returned}",
+                        f"num_added={added}",
+                        f"seed_count={seed_count}",
+                        f"seen_union_size={len(world_cache._seen)}",
                     )
-                    if profiler is not None and log_rng.random() < 0.01:
-                        print(
-                            "[SIM_PROFILE_DETAIL] topup",
-                            f"N_before_filter={n_before_filter}",
-                            f"N_after_filter={n_after_filter}",
-                            f"N_before_topup={start_size}",
-                            f"MIN_KEEP={min_keep}",
-                            f"TOPUP_TO={topup_to}",
-                            f"target_worlds={desired}",
-                            "max_attempts_factor=default",
-                            f"existing_empty={seed_count == 0}",
-                            f"N_returned={n_returned}",
-                            f"num_added={added}",
-                            f"seed_count={seed_count}",
-                            f"seen_union_size={len(world_cache._seen)}",
-                        )
-                    loops += 1
-                    last_added = added
-                    if added <= 0:
-                        break
             posterior = world_cache.posterior()
             if profiler is not None:
                 profiler.record_posterior_call()
@@ -604,6 +639,9 @@ def _simulate_model_game(
                 if ship_idx is not None:
                     assigned_hits[hit_ship] = set(true_layout[hit_ship].cells)
                     assigned_hit_masks[ship_idx] = true_layout[hit_ship].mask
+                    if _env_flag("SIM_DEBUG_ASSERTS", False):
+                        assert assigned_hit_masks[ship_idx] == true_layout[hit_ship].mask
+                        assert (assigned_hit_masks[ship_idx] & ~hit_mask) == 0
                 if hit_ship not in frozen_ships:
                     if sim_placements is placements:
                         sim_placements = dict(placements)
