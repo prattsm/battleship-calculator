@@ -115,6 +115,7 @@ class ModelStatsTab(QtWidgets.QWidget):
         self._last_persist_log: Dict[str, float] = {}
         self._persist_log_interval = 1.0
         self._stats_lock = QtCore.QMutex()
+        self._active_sim_keys: List[str] = []
 
         self._build_ui()
         self.load_state()
@@ -762,6 +763,8 @@ class ModelStatsTab(QtWidgets.QWidget):
                 work_order[key] = needed
                 total_jobs += needed
 
+        self._active_sim_keys = list(work_order.keys())
+
         if total_jobs == 0:
             QtWidgets.QMessageBox.information(
                 self,
@@ -861,7 +864,13 @@ class ModelStatsTab(QtWidgets.QWidget):
                     None,
                     None,
                 )
-        self._save_state_with_logging(list(delta_stats.keys()), merge_snapshot, "final_save", force_log=True)
+        keys = list(delta_stats.keys()) or list(self._active_sim_keys)
+        self._save_state_with_logging(keys, merge_snapshot, "final_save", force_log=True)
+        for key in keys:
+            stats = self.model_stats.get(key, {})
+            games = int(stats.get("total_games", 0)) if isinstance(stats, dict) else 0
+            debug_event(self, "ModelStats Persist", f"model={key} stage=final_totals mem_total={games}")
+        self._active_sim_keys = []
         del locker
         self.refresh_table()
         self.update_summary_label()
@@ -876,6 +885,15 @@ class ModelStatsTab(QtWidgets.QWidget):
         self.games_spin.setEnabled(True)
         # leave progress bar at its final max
         self.progress_bar.setValue(self.progress_bar.maximum())
+        if self._active_sim_keys:
+            locker = QtCore.QMutexLocker(self._stats_lock)
+            self._save_state_with_logging(self._active_sim_keys, {}, "thread_finished_save", force_log=True)
+            for key in self._active_sim_keys:
+                stats = self.model_stats.get(key, {})
+                games = int(stats.get("total_games", 0)) if isinstance(stats, dict) else 0
+                debug_event(self, "ModelStats Persist", f"model={key} stage=thread_finished mem_total={games}")
+            self._active_sim_keys = []
+            del locker
 
 
 class SimulationWorker(QtCore.QObject):
