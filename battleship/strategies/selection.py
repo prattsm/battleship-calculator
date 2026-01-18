@@ -1,10 +1,19 @@
 import math
 import random
+import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from battleship.domain.board import cell_index
 from battleship.domain.config import BOARD_SIZE, EMPTY, HIT, MISS
 from battleship.domain.worlds import compute_min_expected_worlds_after_one_shot, sample_worlds
+
+
+@dataclass
+class Posterior:
+    worlds_union: List[int]
+    cell_hit_counts: List[int]
+    N: int
 
 
 def two_ply_selection(
@@ -113,6 +122,8 @@ def _choose_next_shot_for_strategy(
     known_sunk: Optional[Set[str]] = None,
     known_assigned: Optional[Dict[str, Set[Tuple[int, int]]]] = None,
     params: Optional[Dict[str, float]] = None,
+    posterior: Optional[Posterior] = None,
+    profiler: Optional[object] = None,
 ) -> Tuple[int, int]:
     """
     Choose the next shot for the given strategy using the current board state.
@@ -140,15 +151,27 @@ def _choose_next_shot_for_strategy(
     confirmed_sunk = known_sunk if known_sunk is not None else set()
     assigned_hits = known_assigned if known_assigned is not None else {s: set() for s in ship_ids}
 
-    worlds_union, cell_hit_counts, _, N = sample_worlds(
-        board,
-        placements,
-        ship_ids,
-        confirmed_sunk,
-        assigned_hits,
-        rng_seed=rng.randint(0, 2 ** 31 - 1),
-        board_size=board_size,
-    )
+    if posterior is None:
+        sample_start = time.perf_counter()
+        worlds_union, cell_hit_counts, _, N = sample_worlds(
+            board,
+            placements,
+            ship_ids,
+            confirmed_sunk,
+            assigned_hits,
+            rng_seed=rng.randint(0, 2 ** 31 - 1),
+            board_size=board_size,
+        )
+        sample_time = time.perf_counter() - sample_start
+        if profiler is not None:
+            try:
+                profiler.record_sample(sample_time, N, topup=False)
+            except Exception:
+                pass
+    else:
+        worlds_union = posterior.worlds_union
+        cell_hit_counts = posterior.cell_hit_counts
+        N = posterior.N
 
     if N <= 0:
         return rng.choice(unknown_cells)

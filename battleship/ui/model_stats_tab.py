@@ -1,6 +1,7 @@
 import itertools
 import json
 import math
+import os
 import random
 import time
 from datetime import datetime
@@ -11,7 +12,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from battleship.domain.config import PARAM_SPECS
 from battleship.layouts.cache import LayoutRuntime
 from battleship.persistence.layout_state import find_layout_versions, load_layout_state, save_layout_state
-from battleship.sim.attack_sim import simulate_model_game, simulate_model_game_with_phases
+from battleship.sim.attack_sim import SimProfiler, simulate_model_game, simulate_model_game_with_phases
 from battleship.strategies.registry import model_defs
 from battleship.domain.phase import PHASE_ENDGAME, PHASE_HUNT, PHASE_TARGET
 from battleship.ui.theme import Theme
@@ -19,6 +20,13 @@ from battleship.utils.debug import debug_event
 
 
 PHASES = [PHASE_HUNT, PHASE_TARGET, PHASE_ENDGAME]
+
+
+def _sim_profile_enabled() -> bool:
+    raw = os.getenv("SIM_PROFILE")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _hist_percentile(hist: List[int], pct: float) -> int:
@@ -789,6 +797,12 @@ class SimulationWorker(QtCore.QObject):
             self.finished.emit({})
             return
 
+        profile_enabled = _sim_profile_enabled()
+        profilers: Dict[str, SimProfiler] = {}
+        if profile_enabled:
+            for key in self.work_order.keys():
+                profilers[key] = SimProfiler()
+
         # NEW: Update roughly every 1% or every 1 game, whichever is larger
         update_interval = max(1, total_jobs // 100)
         checkpoint_interval = max(1, total_jobs // 20)
@@ -811,6 +825,7 @@ class SimulationWorker(QtCore.QObject):
                     self.ship_ids,
                     self.board_size,
                     rng,
+                    profiler=profilers.get(key) if profile_enabled else None,
                 )
 
                 stats["total_games"] = int(stats.get("total_games", 0)) + 1
@@ -866,6 +881,10 @@ class SimulationWorker(QtCore.QObject):
 
             if self._cancelled:
                 break
+            if profile_enabled and key in profilers and profilers[key].games > 0:
+                summary = profilers[key].format_summary(f"model={key}")
+                print(summary)
+                profilers[key].reset()
 
         final_payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
         self.finished.emit(final_payload)
@@ -896,6 +915,8 @@ class CustomSimWorker(QtCore.QThread):
             total_shots = 0
             sum_sq = 0
             ran = 0
+            profile_enabled = _sim_profile_enabled()
+            profiler = SimProfiler() if profile_enabled else None
 
             for _ in range(self.count):
                 if self.is_cancelled:
@@ -908,6 +929,7 @@ class CustomSimWorker(QtCore.QThread):
                     self.board_size,
                     rng=rng,
                     params=self.params,
+                    profiler=profiler,
                 )
                 total_shots += shots
                 sum_sq += shots * shots
@@ -924,6 +946,8 @@ class CustomSimWorker(QtCore.QThread):
                 self.result.emit(avg, std, ran)
             else:
                 self.result.emit(0.0, 0.0, 0)
+            if profile_enabled and profiler is not None and profiler.games > 0:
+                print(profiler.format_summary(f"custom={self.strategy}"))
         except Exception:
             import traceback as _tb
             self.error.emit(_tb.format_exc())
