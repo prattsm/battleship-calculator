@@ -949,6 +949,19 @@ class SimulationWorker(QtCore.QObject):
         blank = self._blank_stats()
         stats.clear()
         stats.update(blank)
+        if _sim_debug_stats_enabled():
+            check = self._blank_stats()
+            try:
+                assert id(blank["hist"]) != id(check["hist"])
+                for phase in PHASES:
+                    assert id(blank["phase"][phase]["hist"]) != id(check["phase"][phase]["hist"])
+            except AssertionError:
+                debug_event(
+                    None,
+                    "ModelStats Debug",
+                    "blank_stats_shared_reference_detected",
+                    level="warning",
+                )
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -1035,7 +1048,9 @@ class SimulationWorker(QtCore.QObject):
                 if done - last_checkpoint_done >= checkpoint_interval:
                     payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
                     if payload:
-                        self.checkpoint.emit(payload, done, total_jobs)
+                        import copy
+                        safe_payload = {k: copy.deepcopy(v) for k, v in payload.items()}
+                        self.checkpoint.emit(safe_payload, done, total_jobs)
                         for k in payload.keys():
                             self._reset_stats_in_place(pending[k])
                         if _sim_debug_stats_enabled():
@@ -1065,7 +1080,12 @@ class SimulationWorker(QtCore.QObject):
                 profilers[key].reset()
 
         final_payload = {k: v for k, v in pending.items() if int(v.get("total_games", 0)) > 0}
-        self.finished.emit(final_payload)
+        if final_payload:
+            import copy
+            safe_final = {k: copy.deepcopy(v) for k, v in final_payload.items()}
+            self.finished.emit(safe_final)
+        else:
+            self.finished.emit({})
 
 
 class CustomSimWorker(QtCore.QThread):
