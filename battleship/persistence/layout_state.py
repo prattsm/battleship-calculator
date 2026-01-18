@@ -43,8 +43,12 @@ def save_layout_state(path: str, layout: LayoutDefinition, state: Dict[str, Any]
     layouts = data.setdefault("layouts", {})
     layouts[layout_key(layout)] = state
     try:
-        with open(path, "w") as f:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
     except OSError:
         pass
 

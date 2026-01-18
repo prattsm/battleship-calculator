@@ -112,6 +112,9 @@ class ModelStatsTab(QtWidgets.QWidget):
         self._sim_thread: Optional[QtCore.QThread] = None
         self._sim_worker: Optional[SimulationWorker] = None
         self._last_checkpoint_save = 0.0
+        self._last_persist_log: Dict[str, float] = {}
+        self._persist_log_interval = 1.0
+        self._stats_lock = QtCore.QMutex()
 
         self._build_ui()
         self.load_state()
@@ -274,6 +277,91 @@ class ModelStatsTab(QtWidgets.QWidget):
             "model_overrides": self.model_overrides,
         }
         save_layout_state(path, self.layout, state)
+
+    def _disk_games_for_key(self, key: str) -> int:
+        data, _raw = load_layout_state(self.STATE_PATH, self.layout)
+        if not data:
+            return 0
+        stats = data.get("model_stats")
+        if not isinstance(stats, dict):
+            return 0
+        entry = stats.get(key, {})
+        if not isinstance(entry, dict):
+            return 0
+        return int(entry.get("total_games", 0))
+
+    def _should_log_persist(self, key: str) -> bool:
+        now = time.time()
+        last = self._last_persist_log.get(key, 0.0)
+        if now - last >= self._persist_log_interval:
+            self._last_persist_log[key] = now
+            return True
+        return False
+
+    def _log_persist(
+        self,
+        key: str,
+        stage: str,
+        disk_before: int,
+        mem_before: int,
+        mem_after: int,
+        mem_at_save: Optional[int],
+        disk_after: Optional[int],
+    ) -> None:
+        self._last_persist_log[key] = time.time()
+        msg = (
+            f"model={key} stage={stage} "
+            f"disk_before={disk_before} "
+            f"mem_before={mem_before} "
+            f"mem_after={mem_after}"
+        )
+        if mem_at_save is not None:
+            msg += f" mem_at_save={mem_at_save}"
+        if disk_after is not None:
+            msg += f" disk_after={disk_after}"
+        debug_event(self, "ModelStats Persist", msg)
+
+    def _save_state_with_logging(
+        self,
+        keys: List[str],
+        merge_snapshot: Dict[str, Tuple[int, int]],
+        stage: str,
+        *,
+        force_log: bool = False,
+    ) -> None:
+        if not keys:
+            self.save_state()
+            return
+        disk_before: Dict[str, int] = {}
+        for key in keys:
+            if force_log or self._should_log_persist(key):
+                disk_before[key] = self._disk_games_for_key(key)
+
+        mem_at_save: Dict[str, int] = {}
+        for key in keys:
+            stats = self.model_stats.get(key, {})
+            mem_at_save[key] = int(stats.get("total_games", 0)) if isinstance(stats, dict) else 0
+
+        self.save_state()
+
+        disk_after: Dict[str, int] = {}
+        for key in keys:
+            if key in disk_before:
+                disk_after[key] = self._disk_games_for_key(key)
+
+        for key in keys:
+            if key not in disk_before:
+                continue
+            mem_before, mem_after = merge_snapshot.get(key, (mem_at_save.get(key, 0), mem_at_save.get(key, 0)))
+            self._log_persist(
+                key,
+                stage,
+                disk_before[key],
+                mem_before,
+                mem_after,
+                mem_at_save.get(key),
+                disk_after.get(key),
+            )
 
     def add_param_sweep(self, model_key: str, sweep_record: Dict[str, object]) -> None:
         self.param_sweeps.setdefault(model_key, [])
@@ -720,18 +808,61 @@ class ModelStatsTab(QtWidgets.QWidget):
     def _on_worker_checkpoint(self, delta_stats: Dict[str, Dict[str, object]], done: int, total: int):
         if not delta_stats:
             return
+        locker = QtCore.QMutexLocker(self._stats_lock)
+        merge_snapshot: Dict[str, Tuple[int, int]] = {}
         for key, delta in delta_stats.items():
+            stats = self.model_stats.get(key, {})
+            mem_before = int(stats.get("total_games", 0)) if isinstance(stats, dict) else 0
+            disk_before = None
+            if self._should_log_persist(key):
+                disk_before = self._disk_games_for_key(key)
             self._merge_model_stats(key, delta)
+            stats_after = self.model_stats.get(key, {})
+            mem_after = int(stats_after.get("total_games", 0)) if isinstance(stats_after, dict) else mem_before
+            merge_snapshot[key] = (mem_before, mem_after)
+            if disk_before is not None:
+                self._log_persist(
+                    key,
+                    "merge",
+                    disk_before,
+                    mem_before,
+                    mem_after,
+                    None,
+                    None,
+                )
+
         now = time.time()
         if now - self._last_checkpoint_save >= 2.0:
-            self.save_state()
+            self._save_state_with_logging(list(delta_stats.keys()), merge_snapshot, "checkpoint_save", force_log=True)
             self._last_checkpoint_save = now
+        del locker
 
     @QtCore.pyqtSlot(dict)
     def _on_worker_finished(self, delta_stats: Dict[str, Dict[str, object]]):
+        locker = QtCore.QMutexLocker(self._stats_lock)
+        merge_snapshot: Dict[str, Tuple[int, int]] = {}
         for key, delta in delta_stats.items():
+            stats = self.model_stats.get(key, {})
+            mem_before = int(stats.get("total_games", 0)) if isinstance(stats, dict) else 0
+            disk_before = None
+            if self._should_log_persist(key):
+                disk_before = self._disk_games_for_key(key)
             self._merge_model_stats(key, delta)
-        self.save_state()
+            stats_after = self.model_stats.get(key, {})
+            mem_after = int(stats_after.get("total_games", 0)) if isinstance(stats_after, dict) else mem_before
+            merge_snapshot[key] = (mem_before, mem_after)
+            if disk_before is not None:
+                self._log_persist(
+                    key,
+                    "merge_final",
+                    disk_before,
+                    mem_before,
+                    mem_after,
+                    None,
+                    None,
+                )
+        self._save_state_with_logging(list(delta_stats.keys()), merge_snapshot, "final_save", force_log=True)
+        del locker
         self.refresh_table()
         self.update_summary_label()
 
