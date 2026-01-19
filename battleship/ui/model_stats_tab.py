@@ -679,6 +679,18 @@ class ModelStatsTab(QtWidgets.QWidget):
         self.refresh_table()
         self.save_state()
 
+    def clear_model_data(self, model_key: str, *, include_sweeps: bool = True) -> None:
+        key = str(model_key or "").strip()
+        if not key:
+            return
+        self._ensure_all_models()
+        self.model_stats[key] = _blank_stats_dict(self.total_cells)
+        if include_sweeps:
+            self.param_sweeps.pop(key, None)
+        self.refresh_table()
+        self.update_summary_label()
+        self.save_state()
+
     def _merge_model_stats(self, key: str, delta: Dict[str, object]):
         self._ensure_all_models()
         cur = self.model_stats[key]
@@ -2811,6 +2823,13 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         main_layout.addLayout(mid_layout)
 
         footer = QtWidgets.QHBoxLayout()
+        self.delete_data_btn = QtWidgets.QPushButton("Delete Data")
+        self.delete_data_btn.setStyleSheet(
+            "background-color: #3a1b1b; color: #f2dede; border: 1px solid #8b2b2b; padding: 8px; font-weight: bold;"
+        )
+        self.delete_data_btn.clicked.connect(self._delete_model_data)
+        self.delete_data_btn.setEnabled(bool(self.stats_tab) and bool(self._model_key))
+        footer.addWidget(self.delete_data_btn)
         self.save_overrides_btn = QtWidgets.QPushButton("Save")
         self.save_overrides_btn.clicked.connect(self._save_overrides)
         footer.addWidget(self.save_overrides_btn)
@@ -2828,6 +2847,39 @@ QPushButton:disabled {{ background-color: {Theme.BG_PANEL}; color: {Theme.TEXT_M
         self.stats_tab.update_model_override(self._model_key, name, notes)
         title_name = name.strip() or self.model_def.get("name") or self._model_key
         self.setWindowTitle(f"Analysis: {title_name}")
+
+    def _delete_model_data(self) -> None:
+        if self.stats_tab is None or not self._model_key:
+            return
+        sweep_worker = getattr(self, "sweep_worker", None)
+        custom_worker = getattr(self, "worker", None) or getattr(self, "custom_worker", None)
+        sweep_running = bool(sweep_worker) and hasattr(sweep_worker, "isRunning") and sweep_worker.isRunning()
+        custom_running = bool(custom_worker) and hasattr(custom_worker, "isRunning") and custom_worker.isRunning()
+        sim_running = self._sim_thread is not None
+        if sweep_running or custom_running or sim_running:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Simulation Running",
+                "Stop running simulations before deleting data.",
+            )
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Model Data",
+            "This clears all saved simulation results and parameter sweeps for this model.\n"
+            "Your model name/notes will be kept.\n\n"
+            "Continue?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if confirm != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            self._save_overrides()
+        except Exception:
+            pass
+        self.stats_tab.clear_model_data(self._model_key, include_sweeps=True)
+        self.accept()
 
     def accept(self):
         try:

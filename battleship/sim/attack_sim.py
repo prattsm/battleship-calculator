@@ -123,6 +123,7 @@ class SimProfiler:
         self.phase_shots = 0
         self.posterior_used_by_phase: Dict[str, int] = {}
         self.posterior_skipped_by_phase: Dict[str, int] = {}
+        self.posterior_degraded = 0
 
     def record_layout_time(self, dt: float) -> None:
         self.layout_time += float(dt)
@@ -154,6 +155,9 @@ class SimProfiler:
         key = phase or "unknown"
         target = self.posterior_used_by_phase if used else self.posterior_skipped_by_phase
         target[key] = int(target.get(key, 0)) + 1
+
+    def record_posterior_degraded(self) -> None:
+        self.posterior_degraded += 1
 
     def record_phase_shots(self, count: int) -> None:
         self.phase_shots += int(count)
@@ -224,6 +228,7 @@ class SimProfiler:
             f"  posterior_calls={self.posterior_calls} ({posterior_per_shot:.2f}/shot)\n"
             f"  posterior_used_by_phase={self.posterior_used_by_phase}\n"
             f"  posterior_skipped_by_phase={self.posterior_skipped_by_phase}\n"
+            f"  posterior_degraded={self.posterior_degraded}\n"
             f"  filter_time={self.filter_time:.4f}s ({avg_filter:.6f}s/shot), "
             f"avg_worlds_before_filter={avg_worlds_before:.1f}, "
             f"avg_worlds_after_filter={avg_worlds_after:.1f}, "
@@ -356,17 +361,7 @@ class WorldCache:
                 profiler.record_sample(sample_time, N, topup=bool(existing_union))
 
             added = 0
-            start_idx = 0
-            if seed_count > 0 and len(worlds_union) >= seed_count:
-                head_ok = True
-                for u in worlds_union[:seed_count]:
-                    if u not in self._seen:
-                        head_ok = False
-                        break
-                if head_ok:
-                    start_idx = seed_count
-
-            for union_mask, ship_masks_tuple in zip(worlds_union[start_idx:], worlds_ship_masks[start_idx:]):
+            for union_mask, ship_masks_tuple in zip(worlds_union, worlds_ship_masks):
                 if union_mask in self._seen:
                     continue
                 self._seen.add(union_mask)
@@ -378,19 +373,24 @@ class WorldCache:
 
         added, N, seed_count = run_sample(max_attempts_factor)
         if added <= 0 and max_attempts_factor is None:
-            retry_factor = _env_int("SIM_TOPUP_RETRY_FACTOR", 60)
+            retry_factor = _env_int("SIM_TOPUP_RETRY_FACTOR", 25)
+            retry_cap_raw = os.getenv("SIM_TOPUP_RETRY_CAP")
+            if retry_cap_raw is not None:
+                retry_cap = _env_int("SIM_TOPUP_RETRY_CAP", retry_factor)
+                if retry_cap > 0:
+                    retry_factor = min(retry_factor, retry_cap)
             if retry_factor > 0:
                 added_retry, N_retry, seed_count = run_sample(retry_factor)
-                added += added_retry
+                added = added_retry
                 N = N_retry
 
-        no_progress = (added <= 0 or N <= seed_count)
+        no_progress = (added <= 0)
         if no_progress:
             self.no_progress_topups += 1
         else:
             self.no_progress_topups = 0
             self.saturated = False
-        if self.no_progress_topups >= 2:
+        if self.no_progress_topups >= 3:
             self.saturated = True
             self.saturated_N = len(self.unions)
         return added, N, seed_count
@@ -488,6 +488,17 @@ def _simulate_model_game(
 
     shots = 0
     total_cells = board_size * board_size
+    unknown_cells = [(r, c) for r in range(board_size) for c in range(board_size)]
+    unknown_index = {cell: i for i, cell in enumerate(unknown_cells)}
+
+    def _remove_unknown(cell: Tuple[int, int]) -> None:
+        idx = unknown_index.pop(cell, None)
+        if idx is None:
+            return
+        last = unknown_cells.pop()
+        if idx < len(unknown_cells):
+            unknown_cells[idx] = last
+            unknown_index[last] = idx
     ships_remaining = len(ship_ids)
 
     # 3. Game Loop
@@ -522,25 +533,26 @@ def _simulate_model_game(
             if strategy == "random":
                 skip_posterior = True
             elif strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
-                if not any(board[r][c] == HIT for r in range(board_size) for c in range(board_size)):
+                if hit_mask == 0:
                     skip_posterior = True
 
             posterior_used = False
             if skip_posterior:
-                unknown_cells = [
-                    (r, c)
-                    for r in range(board_size)
-                    for c in range(board_size)
-                    if board[r][c] == EMPTY
-                ]
                 if not unknown_cells:
                     r, c = 0, 0
                 elif strategy == "random":
                     r, c = rng.choice(unknown_cells)
                 elif strategy == "systematic_checkerboard":
-                    sorted_cells = sorted(unknown_cells, key=lambda p: (p[0], p[1]))
-                    whites = [p for p in sorted_cells if (p[0] + p[1]) % 2 == 0]
-                    r, c = whites[0] if whites else sorted_cells[0]
+                    white_min = None
+                    any_min = None
+                    for cell in unknown_cells:
+                        if any_min is None or cell < any_min:
+                            any_min = cell
+                        if (cell[0] + cell[1]) % 2 == 0:
+                            if white_min is None or cell < white_min:
+                                white_min = cell
+                    pick = white_min if white_min is not None else any_min
+                    r, c = pick if pick is not None else (0, 0)
                 elif strategy == "diagonal_stripe":
                     diagonals = [p for p in unknown_cells if (p[0] - p[1]) % 4 == 0]
                     if diagonals:
@@ -614,6 +626,8 @@ def _simulate_model_game(
                             f"seen_union_size={len(world_cache._seen)}",
                         )
                 posterior = world_cache.posterior()
+                if profiler is not None and world_cache.saturated:
+                    profiler.record_posterior_degraded()
                 posterior_used = True
                 selection_start = time.perf_counter()
                 r, c = _choose_next_shot_for_strategy(
@@ -656,19 +670,14 @@ def _simulate_model_game(
             if board[r][c] != EMPTY:
                 if _env_flag("SIM_DEBUG_STATS", False):
                     assert board[r][c] == EMPTY, "Selected a non-empty cell"
-                fallback = [
-                    (rr, cc)
-                    for rr in range(board_size)
-                    for cc in range(board_size)
-                    if board[rr][cc] == EMPTY
-                ]
-                if fallback:
-                    r, c = rng.choice(fallback)
+                if unknown_cells:
+                    r, c = rng.choice(unknown_cells)
 
             idx = cell_index(r, c, board_size)
             is_hit = (used_mask >> idx) & 1
 
             board[r][c] = HIT if is_hit else MISS
+            _remove_unknown((r, c))
             shots += 1
             if profiler is not None:
                 profiler.record_shot()
@@ -708,6 +717,8 @@ def _simulate_model_game(
                             sim_placements = dict(placements)
                         sim_placements[hit_ship] = [true_layout[hit_ship]]
                         frozen_ships.add(hit_ship)
+                        if world_cache is not None:
+                            world_cache.clear()
 
     finally:
         if trace_enabled:
@@ -719,9 +730,10 @@ def _simulate_model_game(
                     pass
     if profiler is not None:
         profiler.record_game()
-        if track_phases and _env_flag("SIM_DEBUG_STATS", False):
+        if _env_flag("SIM_DEBUG_STATS", False):
             total_phase = sum(phase_counts.values()) if phase_counts else 0
-            assert total_phase == shots, "Phase counts must sum to shots in sim"
+            if track_phases:
+                assert total_phase == shots, "Phase counts must sum to shots in sim"
             used = sum(profiler.posterior_used_by_phase.values())
             skipped = sum(profiler.posterior_skipped_by_phase.values())
             assert used + skipped == profiler.posterior_calls, "Posterior phase counts must match calls"
