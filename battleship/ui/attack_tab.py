@@ -37,7 +37,7 @@ from battleship.persistence.layout_state import load_layout_state, save_layout_s
 from battleship.persistence.model_selection import load_best_models
 from battleship.persistence.stats import StatsTracker
 from battleship.sim.defense_sim import build_base_heat, simulate_enemy_game_phase
-from battleship.strategies.selection import _choose_next_shot_for_strategy, two_ply_selection
+from battleship.strategies.selection import Posterior, _choose_next_shot_for_strategy, two_ply_selection
 from battleship.strategies.registry import model_defs
 from battleship.ui.theme import Theme
 
@@ -1245,18 +1245,58 @@ class AttackTab(QtWidgets.QWidget):
             higher_better = False
             return self._two_ply_candidates(unknown_cells), score_label, higher_better, note
 
+        if model_key in {
+            "assigned_target_marginal",
+            "minlen_parity_entropy",
+            "ewa1_pruned",
+            "placement_factorized",
+            "endgame_exact_combo",
+            "meta_ucb_hybrid",
+        }:
+            score_label = "p(hit)"
+            hit_mask = 0
+            miss_mask = 0
+            for r in range(self.board_size):
+                for c in range(self.board_size):
+                    idx = cell_index(r, c, self.board_size)
+                    if self.board[r][c] == HIT:
+                        hit_mask |= 1 << idx
+                    elif self.board[r][c] == MISS:
+                        miss_mask |= 1 << idx
+            posterior = Posterior(self.world_masks, self.cell_hit_counts, self.num_world_samples)
+            rng = random.Random(0)
+            r, c = _choose_next_shot_for_strategy(
+                model_key,
+                self.board,
+                self.placements,
+                rng,
+                self.ship_ids,
+                board_size=self.board_size,
+                known_sunk=self.confirmed_sunk,
+                known_assigned=self.assigned_hits,
+                posterior=posterior,
+                unknown_cells=unknown_cells,
+                has_any_hit=bool(hit_mask),
+                hit_mask=hit_mask,
+                miss_mask=miss_mask,
+            )
+            if self.board[r][c] != EMPTY:
+                r, c = random.choice(unknown_cells)
+            candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": p_hit(r, c)})
+            note = "Selection engine"
+            return candidates, score_label, higher_better, note
+
         if model_key == "entropy1":
             score_label = "Info (1-ply)"
 
             def score_entropy(r: int, c: int) -> float:
                 idx = cell_index(r, c, self.board_size)
                 n_hit = self.cell_hit_counts[idx]
-                n_miss = N - n_hit
-                if n_hit == 0 or n_miss == 0:
-                    return -1.0e9
+                if n_hit <= 0 or n_hit >= N:
+                    return 0.0
                 p_h = n_hit / N
                 p_m = 1.0 - p_h
-                return -(p_h * math.log(max(1, n_hit)) + p_m * math.log(max(1, n_miss)))
+                return -(p_h * math.log2(p_h) + p_m * math.log2(p_m))
 
             for r, c in unknown_cells:
                 candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": score_entropy(r, c)})

@@ -41,6 +41,42 @@ def model_defs() -> List[Dict[str, object]]:
             "notes": "A parity-flavored variant of Greedy. Helps in hunt mode when minimum ship length makes parity efficient.",
         },
         {
+            "key": "minlen_parity_entropy",
+            "name": "Min-Length Parity (Entropy)",
+            "description": "Hunts on the best modulo class based on remaining ship lengths, then picks by info gain.",
+            "notes": "Uses the minimum remaining ship length to choose an efficient parity slice in hunt mode; switches to a targeter when hits are active.",
+        },
+        {
+            "key": "assigned_target_marginal",
+            "name": "Assigned Target Marginal",
+            "description": "Exact target mode using per-ship assigned hits and placement marginals.",
+            "notes": "For each ship with assigned hits, computes placement marginals that satisfy those hits and chooses the strongest target cell.",
+        },
+        {
+            "key": "placement_factorized",
+            "name": "Placement Factorized",
+            "description": "Approximate probability map by summing per-ship placement counts (no world sampling).",
+            "notes": "Fast and stable even with unusual ship sets. A strong baseline when sampling is expensive or inconsistent.",
+        },
+        {
+            "key": "endgame_exact_combo",
+            "name": "Endgame Exact Combo",
+            "description": "Enumerates exact placement combinations when the remaining search space is small.",
+            "notes": "Triggers late game (few ships left or low combo count) to compute exact marginals; otherwise falls back to posterior-based scoring.",
+        },
+        {
+            "key": "ewa1_pruned",
+            "name": "EWA 1-ply (Pruned)",
+            "description": "Expected worlds-after-one-shot with pruning to top candidates.",
+            "notes": "Evaluates a small set of top cells with a 1-ply expected-worlds metric; balances quality and speed.",
+        },
+        {
+            "key": "meta_ucb_hybrid",
+            "name": "Meta UCB Hybrid",
+            "description": "Online bandit that chooses among several base scorers each shot.",
+            "notes": "Uses a UCB-style selector over Greedy, Info Gain, parity hunt, and factorized placements to adapt over time.",
+        },
+        {
             "key": "random_checkerboard",
             "name": "Random Checkerboard",
             "description": "Randomly hunts only one checkerboard color (parity).",

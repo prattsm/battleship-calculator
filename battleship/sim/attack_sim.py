@@ -564,90 +564,111 @@ def _simulate_model_game(
                     whites = [p for p in unknown_cells if (p[0] + p[1]) % 2 == 0]
                     r, c = rng.choice(whites) if whites else rng.choice(unknown_cells)
             elif fast_mode and world_cache is not None:
-                min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
-                if env_min_keep is not None:
-                    min_keep = _env_int("SIM_MIN_KEEP", min_keep)
-                if env_topup_to is not None:
-                    if os.getenv("SIM_TOPUP_TO") is not None:
-                        topup_to = _env_int("SIM_TOPUP_TO", topup_to)
-                    else:
-                        topup_to = _env_int("SIM_REFILL_TARGET", topup_to)
-                if topup_to > base_target:
-                    topup_to = base_target
-                if min_keep > topup_to:
-                    min_keep = topup_to
-                n_before_filter = world_cache.size
-                world_cache.filter_in_place(
-                    miss_mask,
-                    assigned_hit_masks,
-                    hit_mask,
-                    confirmed_sunk,
-                    profiler=profiler,
-                )
-                n_after_filter = world_cache.size
-                if world_cache.size == 0:
-                    world_cache.clear()
-                if not world_cache.saturated and world_cache.size < min_keep:
-                    if profiler is not None:
-                        profiler.record_topup(
-                            n_before=world_cache.size,
-                            current_shot=shots,
-                            reason_lowN=True,
-                            reason_empty=(world_cache.size == 0),
-                            reason_strategy_full=_is_heavy_strategy(strategy),
-                        )
-                    start_size = world_cache.size
-                    desired = topup_to
-                    added, n_returned, seed_count = world_cache.top_up(
+                if strategy in {"placement_factorized", "assigned_target_marginal"}:
+                    selection_start = time.perf_counter()
+                    r, c = _choose_next_shot_for_strategy(
+                        strategy,
                         board,
                         sim_placements,
-                        ship_ids,
-                        confirmed_sunk,
-                        assigned_hits,
                         rng,
-                        target_worlds=desired,
-                        max_attempts_factor=None,
+                        ship_ids,
+                        board_size,
+                        known_sunk=confirmed_sunk,
+                        known_assigned=assigned_hits,
+                        params=params,
+                        unknown_cells=unknown_cells,
+                        has_any_hit=bool(hit_mask),
+                        hit_mask=hit_mask,
+                        miss_mask=miss_mask,
+                    )
+                    if profiler is not None:
+                        profiler.record_selection(time.perf_counter() - selection_start)
+                    posterior_used = False
+                else:
+                    min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
+                    if env_min_keep is not None:
+                        min_keep = _env_int("SIM_MIN_KEEP", min_keep)
+                    if env_topup_to is not None:
+                        if os.getenv("SIM_TOPUP_TO") is not None:
+                            topup_to = _env_int("SIM_TOPUP_TO", topup_to)
+                        else:
+                            topup_to = _env_int("SIM_REFILL_TARGET", topup_to)
+                    if topup_to > base_target:
+                        topup_to = base_target
+                    if min_keep > topup_to:
+                        min_keep = topup_to
+                    n_before_filter = world_cache.size
+                    world_cache.filter_in_place(
+                        miss_mask,
+                        assigned_hit_masks,
+                        hit_mask,
+                        confirmed_sunk,
                         profiler=profiler,
                     )
-                    if profiler is not None and log_rng.random() < 0.01:
-                        print(
-                            "[SIM_PROFILE_DETAIL] topup",
-                            f"N_before_filter={n_before_filter}",
-                            f"N_after_filter={n_after_filter}",
-                            f"N_before_topup={start_size}",
-                            f"MIN_KEEP={min_keep}",
-                            f"TOPUP_TO={topup_to}",
-                            f"target_worlds={desired}",
-                            "max_attempts_factor=default",
-                            f"existing_empty={seed_count == 0}",
-                            f"N_returned={n_returned}",
-                            f"num_added={added}",
-                            f"seed_count={seed_count}",
-                            f"seen_union_size={len(world_cache._seen)}",
+                    n_after_filter = world_cache.size
+                    if world_cache.size == 0:
+                        world_cache.clear()
+                    if not world_cache.saturated and world_cache.size < min_keep:
+                        if profiler is not None:
+                            profiler.record_topup(
+                                n_before=world_cache.size,
+                                current_shot=shots,
+                                reason_lowN=True,
+                                reason_empty=(world_cache.size == 0),
+                                reason_strategy_full=_is_heavy_strategy(strategy),
+                            )
+                        start_size = world_cache.size
+                        desired = topup_to
+                        added, n_returned, seed_count = world_cache.top_up(
+                            board,
+                            sim_placements,
+                            ship_ids,
+                            confirmed_sunk,
+                            assigned_hits,
+                            rng,
+                            target_worlds=desired,
+                            max_attempts_factor=None,
+                            profiler=profiler,
                         )
-                posterior = world_cache.posterior()
-                if profiler is not None and world_cache.saturated:
-                    profiler.record_posterior_degraded()
-                posterior_used = True
-                selection_start = time.perf_counter()
-                r, c = _choose_next_shot_for_strategy(
-                    strategy,
-                    board,
-                    sim_placements,
-                    rng,
-                    ship_ids,
-                    board_size,
-                    known_sunk=confirmed_sunk,
-                    known_assigned=assigned_hits,
-                    params=params,
-                    posterior=posterior,
-                    unknown_cells=unknown_cells,
-                    has_any_hit=bool(hit_mask),
-                    hit_mask=hit_mask,
-                    miss_mask=miss_mask,
-                )
-                if profiler is not None:
-                    profiler.record_selection(time.perf_counter() - selection_start)
+                        if profiler is not None and log_rng.random() < 0.01:
+                            print(
+                                "[SIM_PROFILE_DETAIL] topup",
+                                f"N_before_filter={n_before_filter}",
+                                f"N_after_filter={n_after_filter}",
+                                f"N_before_topup={start_size}",
+                                f"MIN_KEEP={min_keep}",
+                                f"TOPUP_TO={topup_to}",
+                                f"target_worlds={desired}",
+                                "max_attempts_factor=default",
+                                f"existing_empty={seed_count == 0}",
+                                f"N_returned={n_returned}",
+                                f"num_added={added}",
+                                f"seed_count={seed_count}",
+                                f"seen_union_size={len(world_cache._seen)}",
+                            )
+                    posterior = world_cache.posterior()
+                    if profiler is not None and world_cache.saturated:
+                        profiler.record_posterior_degraded()
+                    posterior_used = True
+                    selection_start = time.perf_counter()
+                    r, c = _choose_next_shot_for_strategy(
+                        strategy,
+                        board,
+                        sim_placements,
+                        rng,
+                        ship_ids,
+                        board_size,
+                        known_sunk=confirmed_sunk,
+                        known_assigned=assigned_hits,
+                        params=params,
+                        posterior=posterior,
+                        unknown_cells=unknown_cells,
+                        has_any_hit=bool(hit_mask),
+                        hit_mask=hit_mask,
+                        miss_mask=miss_mask,
+                    )
+                    if profiler is not None:
+                        profiler.record_selection(time.perf_counter() - selection_start)
             else:
                 selection_start = time.perf_counter()
                 r, c = _choose_next_shot_for_strategy(

@@ -23,6 +23,13 @@ python -m unittest discover -s tests
 python scripts/smoke_run.py
 ```
 
+## Strategy harness (CLI)
+Compare strategies on fixed RNG seeds (deterministic across runs).
+
+```bash
+python scripts/strategy_harness.py --layout classic --games 200 --models all
+```
+
 ## Model Sim Multiprocessing
 Model Stats simulations can run in parallel to reduce wall-clock time. Results are deterministic for a fixed global seed, regardless of worker count or chunk size.
 
