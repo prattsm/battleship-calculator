@@ -641,6 +641,10 @@ def _simulate_model_game(
                     known_assigned=assigned_hits,
                     params=params,
                     posterior=posterior,
+                    unknown_cells=unknown_cells,
+                    has_any_hit=bool(hit_mask),
+                    hit_mask=hit_mask,
+                    miss_mask=miss_mask,
                 )
                 if profiler is not None:
                     profiler.record_selection(time.perf_counter() - selection_start)
@@ -657,6 +661,10 @@ def _simulate_model_game(
                     known_assigned=assigned_hits,
                     params=params,
                     profiler=profiler,
+                    unknown_cells=unknown_cells,
+                    has_any_hit=bool(hit_mask),
+                    hit_mask=hit_mask,
+                    miss_mask=miss_mask,
                 )
                 if profiler is not None:
                     sample_time = profiler.consume_last_sample_time()

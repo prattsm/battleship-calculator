@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -14,6 +15,73 @@ class Posterior:
     worlds_union: List[int]
     cell_hit_counts: List[int]
     N: int
+
+
+_NEIGHBORS4_CACHE: Dict[int, List[List[Tuple[int, int]]]] = {}
+
+
+def _neighbors4(board_size: int) -> List[List[Tuple[int, int]]]:
+    cached = _NEIGHBORS4_CACHE.get(board_size)
+    if cached is not None:
+        return cached
+    total_cells = board_size * board_size
+    neighbors: List[List[Tuple[int, int]]] = [[] for _ in range(total_cells)]
+    for r in range(board_size):
+        for c in range(board_size):
+            idx = r * board_size + c
+            if r > 0:
+                neighbors[idx].append((r - 1, c))
+            if r + 1 < board_size:
+                neighbors[idx].append((r + 1, c))
+            if c > 0:
+                neighbors[idx].append((r, c - 1))
+            if c + 1 < board_size:
+                neighbors[idx].append((r, c + 1))
+    _NEIGHBORS4_CACHE[board_size] = neighbors
+    return neighbors
+
+
+def _param_float(params: Dict[str, float], key: str, env_name: str, default: float) -> float:
+    if key in params:
+        try:
+            return float(params[key])
+        except (TypeError, ValueError):
+            return default
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _param_int(params: Dict[str, float], key: str, env_name: str, default: int) -> int:
+    if key in params:
+        try:
+            value = int(params[key])
+            return value if value > 0 else default
+        except (TypeError, ValueError):
+            return default
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _mask_to_cells(mask: int, board_size: int) -> List[Tuple[int, int]]:
+    cells: List[Tuple[int, int]] = []
+    m = mask
+    while m:
+        lsb = m & -m
+        idx = lsb.bit_length() - 1
+        cells.append(divmod(idx, board_size))
+        m ^= lsb
+    return cells
 
 
 def two_ply_selection(
@@ -124,6 +192,10 @@ def _choose_next_shot_for_strategy(
     params: Optional[Dict[str, float]] = None,
     posterior: Optional[Posterior] = None,
     profiler: Optional[object] = None,
+    unknown_cells: Optional[Sequence[Tuple[int, int]]] = None,
+    has_any_hit: Optional[bool] = None,
+    hit_mask: Optional[int] = None,
+    miss_mask: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Choose the next shot for the given strategy using the current board state.
@@ -135,19 +207,45 @@ def _choose_next_shot_for_strategy(
     if params is None:
         params = {}
 
-    unknown_cells = [
-        (r, c)
-        for r in range(board_size)
-        for c in range(board_size)
-        if board[r][c] == EMPTY
-    ]
+    total_cells = board_size * board_size
+    hit_cells: Optional[List[Tuple[int, int]]] = None
+    if unknown_cells is None or hit_mask is None or miss_mask is None or has_any_hit is None:
+        calc_unknown: List[Tuple[int, int]] = []
+        calc_hit_mask = 0
+        calc_miss_mask = 0
+        calc_hit_cells: List[Tuple[int, int]] = []
+        for r in range(board_size):
+            for c in range(board_size):
+                state = board[r][c]
+                idx = cell_index(r, c, board_size)
+                if state == EMPTY:
+                    calc_unknown.append((r, c))
+                elif state == HIT:
+                    calc_hit_mask |= 1 << idx
+                    calc_hit_cells.append((r, c))
+                else:
+                    calc_miss_mask |= 1 << idx
+        unknown_cells = calc_unknown
+        if hit_mask is None:
+            hit_mask = calc_hit_mask
+        if miss_mask is None:
+            miss_mask = calc_miss_mask
+        if has_any_hit is None:
+            has_any_hit = bool(calc_hit_mask)
+        hit_cells = calc_hit_cells
+    else:
+        unknown_cells = list(unknown_cells)
+        if has_any_hit is None:
+            has_any_hit = bool(hit_mask)
+
     if not unknown_cells:
         return 0, 0
 
     if strategy == "random":
         return rng.choice(unknown_cells)
 
-    has_any_hit = any(board[r][c] == HIT for r in range(board_size) for c in range(board_size))
+    if has_any_hit is None:
+        has_any_hit = bool(hit_mask)
     if not has_any_hit and strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
         if strategy == "random_checkerboard":
             whites = [(r, c) for (r, c) in unknown_cells if (r + c) % 2 == 0]
@@ -196,14 +294,67 @@ def _choose_next_shot_for_strategy(
     cell_probs = [cnt / N for cnt in cell_hit_counts]
 
     # --- TARGET MODE LOGIC (Refined) ---
-    # Only enter target mode if we have *any* hit on the board and the posterior is confident.
-    max_p = max(cell_probs[cell_index(r, c, board_size)] for r, c in unknown_cells) if unknown_cells else 0.0
-    is_target_mode = has_any_hit and (max_p > 0.30)
+    hit_mask = hit_mask or 0
+    miss_mask = miss_mask or 0
+    if hit_cells is None:
+        hit_cells = _mask_to_cells(hit_mask, board_size)
 
-    if strategy == "two_ply" and has_any_hit:
+    live_hit_set = set(hit_cells)
+    if confirmed_sunk and assigned_hits:
+        for ship in confirmed_sunk:
+            for cell in assigned_hits.get(ship, set()):
+                live_hit_set.discard(cell)
+
+    frontier_mass = 0.0
+    frontier_max = 0.0
+    max_component = 0
+    if live_hit_set:
+        neighbors = _neighbors4(board_size)
+        unknown_set = set(unknown_cells)
+        frontier: Set[Tuple[int, int]] = set()
+        visited: Set[Tuple[int, int]] = set()
+        for start in live_hit_set:
+            if start in visited:
+                continue
+            stack = [start]
+            visited.add(start)
+            comp_size = 0
+            while stack:
+                cr, cc = stack.pop()
+                comp_size += 1
+                idx = cell_index(cr, cc, board_size)
+                for nr, nc in neighbors[idx]:
+                    if (nr, nc) in live_hit_set and (nr, nc) not in visited:
+                        visited.add((nr, nc))
+                        stack.append((nr, nc))
+                    elif (nr, nc) in unknown_set:
+                        frontier.add((nr, nc))
+            if comp_size > max_component:
+                max_component = comp_size
+        if frontier:
+            frontier_mass = sum(cell_probs[cell_index(r, c, board_size)] for r, c in frontier)
+            frontier_max = max(cell_probs[cell_index(r, c, board_size)] for r, c in frontier)
+
+    min_hits = _param_int(params, "target_min_hits", "SIM_TARGET_MIN_HITS", 1)
+    mass_thresh = _param_float(params, "target_frontier_mass", "SIM_TARGET_FRONTIER_MASS", 0.20)
+    max_thresh = _param_float(params, "target_frontier_max", "SIM_TARGET_FRONTIER_MAX", 0.15)
+    comp_thresh = _param_int(params, "target_component_min", "SIM_TARGET_COMPONENT_MIN", 2)
+
+    live_hits = len(live_hit_set)
+    is_target_mode = False
+    if live_hits >= min_hits and live_hits > 0:
+        if frontier_mass >= mass_thresh or frontier_max >= max_thresh or max_component >= comp_thresh:
+            is_target_mode = True
+
+    if is_target_mode and strategy == "entropy1":
         strategy = "greedy"
-    elif is_target_mode and strategy == "entropy1":
-        strategy = "greedy"
+
+    if strategy == "two_ply":
+        unknown_ratio = len(unknown_cells) / max(1, total_cells)
+        min_worlds = _param_int(params, "two_ply_min_worlds", "SIM_TWO_PLY_MIN_WORLDS", 2000)
+        min_unknown = _param_float(params, "two_ply_min_unknown_ratio", "SIM_TWO_PLY_MIN_UNKNOWN_RATIO", 0.60)
+        if is_target_mode or N < min_worlds or unknown_ratio < min_unknown:
+            strategy = "greedy"
 
     # --- ADVANCED STRATEGIES ---
 
@@ -212,14 +363,9 @@ def _choose_next_shot_for_strategy(
         if not is_target_mode:
             strategy = "entropy1"
         else:
-            hits_all = [(r, c) for r in range(board_size) for c in range(board_size) if board[r][c] == HIT]
+            hits_all = list(live_hit_set) if live_hit_set else []
             hit_set = set(hits_all)
-
-            def neighbors4(rr: int, cc: int):
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = rr + dr, cc + dc
-                    if 0 <= nr < board_size and 0 <= nc < board_size:
-                        yield nr, nc
+            neighbors = _neighbors4(board_size)
 
             # Connected components of HITs
             components: List[List[Tuple[int, int]]] = []
@@ -233,7 +379,8 @@ def _choose_next_shot_for_strategy(
                 while stack:
                     cur = stack.pop()
                     comp.append(cur)
-                    for nr, nc in neighbors4(cur[0], cur[1]):
+                    idx = cell_index(cur[0], cur[1], board_size)
+                    for nr, nc in neighbors[idx]:
                         if (nr, nc) in hit_set and (nr, nc) not in visited:
                             visited.add((nr, nc))
                             stack.append((nr, nc))
@@ -251,7 +398,8 @@ def _choose_next_shot_for_strategy(
                 # Frontier = unknown neighbors of the component
                 frontier: Set[Tuple[int, int]] = set()
                 for hr, hc in comp:
-                    for nr, nc in neighbors4(hr, hc):
+                    idx = cell_index(hr, hc, board_size)
+                    for nr, nc in neighbors[idx]:
                         if board[nr][nc] == EMPTY:
                             frontier.add((nr, nc))
                 if not frontier:
@@ -369,64 +517,62 @@ def _choose_next_shot_for_strategy(
             strategy = "greedy"
         else:
             world_samples = worlds_union if len(worlds_union) <= rollouts else rng.sample(worlds_union, rollouts)
+            neighbors = _neighbors4(board_size)
+            base_hits = set(_mask_to_cells(hit_mask, board_size)) if hit_mask else set()
+            base_misses = set(_mask_to_cells(miss_mask, board_size)) if miss_mask else set()
 
-            def neighbours4(rr: int, cc: int):
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = rr + dr, cc + dc
-                    if 0 <= nr < board_size and 0 <= nc < board_size:
-                        yield nr, nc
-
-            def rollout_policy(sim_board: List[List[str]]) -> Tuple[int, int]:
+            def rollout_policy(sim_hits: Set[Tuple[int, int]], sim_misses: Set[Tuple[int, int]]) -> Tuple[int, int]:
                 frontier = []
-                for rr in range(board_size):
-                    for cc in range(board_size):
-                        if sim_board[rr][cc] != HIT:
-                            continue
-                        for nr, nc in neighbours4(rr, cc):
-                            if sim_board[nr][nc] == EMPTY:
-                                frontier.append((nr, nc))
+                for rr, cc in sim_hits:
+                    idx = cell_index(rr, cc, board_size)
+                    for nr, nc in neighbors[idx]:
+                        if (nr, nc) not in sim_hits and (nr, nc) not in sim_misses:
+                            frontier.append((nr, nc))
                 if frontier:
                     return rng.choice(frontier)
-                parity = [(rr, cc) for rr in range(board_size) for cc in range(board_size)
-                          if sim_board[rr][cc] == EMPTY and (rr + cc) % 2 == 0]
+                parity = [
+                    (rr, cc)
+                    for rr, cc in unknown_cells
+                    if (rr, cc) not in sim_hits
+                    and (rr, cc) not in sim_misses
+                    and (rr + cc) % 2 == 0
+                ]
                 if parity:
                     return rng.choice(parity)
-                remaining = [(rr, cc) for rr in range(board_size) for cc in range(board_size)
-                             if sim_board[rr][cc] == EMPTY]
+                remaining = [(rr, cc) for rr, cc in unknown_cells if (rr, cc) not in sim_hits and (rr, cc) not in sim_misses]
                 return rng.choice(remaining) if remaining else (0, 0)
 
             def simulate_rollout(first_cell: Tuple[int, int], world_mask: int) -> int:
-                sim_board = [row[:] for row in board]
-                total_targets = int(bin(world_mask).count("1"))
-                hits = 0
-                for rr in range(board_size):
-                    for cc in range(board_size):
-                        if sim_board[rr][cc] == HIT:
-                            idx = cell_index(rr, cc, board_size)
-                            if (world_mask >> idx) & 1:
-                                hits += 1
-                remaining = max(0, total_targets - hits)
+                sim_hits = set(base_hits)
+                sim_misses = set(base_misses)
+                total_targets = int(world_mask.bit_count())
+                known_hits = int((world_mask & hit_mask).bit_count()) if hit_mask else 0
+                remaining = max(0, total_targets - known_hits)
 
                 shots = 0
                 fr, fc = first_cell
-                if sim_board[fr][fc] == EMPTY:
+                if (fr, fc) not in sim_hits and (fr, fc) not in sim_misses:
                     idx = cell_index(fr, fc, board_size)
                     is_hit = (world_mask >> idx) & 1
-                    sim_board[fr][fc] = HIT if is_hit else MISS
-                    shots += 1
                     if is_hit:
+                        sim_hits.add((fr, fc))
                         remaining -= 1
+                    else:
+                        sim_misses.add((fr, fc))
+                    shots += 1
 
                 while remaining > 0 and shots < max_shots:
-                    r2, c2 = rollout_policy(sim_board)
-                    if sim_board[r2][c2] != EMPTY:
+                    r2, c2 = rollout_policy(sim_hits, sim_misses)
+                    if (r2, c2) in sim_hits or (r2, c2) in sim_misses:
                         break
                     idx2 = cell_index(r2, c2, board_size)
                     is_hit = (world_mask >> idx2) & 1
-                    sim_board[r2][c2] = HIT if is_hit else MISS
-                    shots += 1
                     if is_hit:
+                        sim_hits.add((r2, c2))
                         remaining -= 1
+                    else:
+                        sim_misses.add((r2, c2))
+                    shots += 1
                 if remaining > 0 and shots >= max_shots:
                     shots += remaining
                 return shots
@@ -520,14 +666,14 @@ def _choose_next_shot_for_strategy(
     def score_entropy(r: int, c: int) -> float:
         idx = cell_index(r, c, board_size)
         n_hit = cell_hit_counts[idx]
-        n_miss = N - n_hit
-        if n_hit == 0 or n_miss == 0:
-            return -1.0e9
+        if n_hit <= 0 or n_hit >= N:
+            return 0.0
         p_hit = n_hit / N
         p_miss = 1.0 - p_hit
-        # Keep the existing "count-log" proxy but guard edge cases.
-        E = p_hit * math.log(max(1, n_hit)) + p_miss * math.log(max(1, n_miss))
-        return -E
+        return -(
+            p_hit * math.log2(p_hit)
+            + p_miss * math.log2(p_miss)
+        )
 
     def score_adaptive_skew(r: int, c: int) -> float:
         base_score = cell_probs[cell_index(r, c, board_size)]
@@ -556,8 +702,8 @@ def _choose_next_shot_for_strategy(
     if strategy == "parity_greedy":
         evens = [(rr, cc) for (rr, cc) in unknown_cells if (rr + cc) % 2 == 0]
         odds = [(rr, cc) for (rr, cc) in unknown_cells if (rr + cc) % 2 == 1]
-        even_mass = sum(cell_probs[cell_index(rr, cc)] for rr, cc in evens)
-        odd_mass = sum(cell_probs[cell_index(rr, cc)] for rr, cc in odds)
+        even_mass = sum(cell_probs[cell_index(rr, cc, board_size)] for rr, cc in evens)
+        odd_mass = sum(cell_probs[cell_index(rr, cc, board_size)] for rr, cc in odds)
         prefer_even = even_mass >= odd_mass
 
     def score_parity_greedy(r: int, c: int) -> float:
