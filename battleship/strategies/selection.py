@@ -200,6 +200,11 @@ def _choose_next_shot_for_strategy(
     max_p = max(cell_probs[cell_index(r, c, board_size)] for r, c in unknown_cells) if unknown_cells else 0.0
     is_target_mode = has_any_hit and (max_p > 0.30)
 
+    if strategy == "two_ply" and has_any_hit:
+        strategy = "greedy"
+    elif is_target_mode and strategy == "entropy1":
+        strategy = "greedy"
+
     # --- ADVANCED STRATEGIES ---
 
     if strategy == "endpoint_phase":
