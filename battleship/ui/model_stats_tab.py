@@ -252,6 +252,25 @@ def _set_tooltip_palette(app: QtWidgets.QApplication) -> None:
     app.setPalette(palette)
 
 
+class SortableTableItem(QtWidgets.QTableWidgetItem):
+    def __init__(self, text: str, sort_value=None, align: Optional[QtCore.Qt.Alignment] = None):
+        super().__init__(text)
+        if sort_value is None:
+            sort_value = text
+        self.setData(QtCore.Qt.UserRole, sort_value)
+        if align is not None:
+            self.setTextAlignment(align)
+
+    def __lt__(self, other: "QtWidgets.QTableWidgetItem") -> bool:
+        if isinstance(other, QtWidgets.QTableWidgetItem):
+            a = self.data(QtCore.Qt.UserRole)
+            b = other.data(QtCore.Qt.UserRole)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                return float(a) < float(b)
+            return str(a) < str(b)
+        return super().__lt__(other)
+
+
 class ModelStatsTab(QtWidgets.QWidget):
     STATE_PATH = "battleship_model_stats.json"
 
@@ -744,6 +763,7 @@ class ModelStatsTab(QtWidgets.QWidget):
             cur["phase"] = cur_phase
 
     def refresh_table(self):
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self.model_defs))
 
         for row, md in enumerate(self.model_defs):
@@ -759,34 +779,33 @@ class ModelStatsTab(QtWidgets.QWidget):
             p95 = float(metrics["p95"])
 
             # Column 0: model name (store key in UserRole so lookups never depend on visible text)
-            item_name = QtWidgets.QTableWidgetItem(md["name"])
+            item_name = SortableTableItem(md["name"], sort_value=str(md["name"]))
             item_name.setData(QtCore.Qt.UserRole, key)
             self.table.setItem(row, 0, item_name)
 
             # Numeric columns
-            vals = [
-                str(games),
-                f"{mean:.2f}" if games > 0 else "-",
-                f"{median:.0f}" if games > 0 else "-",
-                f"{std:.2f}" if games > 0 else "-",
-                f"{p90:.0f}" if games > 0 else "-",
-                f"{p95:.0f}" if games > 0 else "-",
-                str(stats.get("min_shots", "-")),
-                str(stats.get("max_shots", "-")),
+            numeric_vals = [
+                (str(games), games),
+                (f"{mean:.2f}" if games > 0 else "-", mean if games > 0 else -1),
+                (f"{median:.0f}" if games > 0 else "-", median if games > 0 else -1),
+                (f"{std:.2f}" if games > 0 else "-", std if games > 0 else -1),
+                (f"{p90:.0f}" if games > 0 else "-", p90 if games > 0 else -1),
+                (f"{p95:.0f}" if games > 0 else "-", p95 if games > 0 else -1),
+                (str(stats.get("min_shots", "-")), int(stats.get("min_shots", -1)) if games > 0 else -1),
+                (str(stats.get("max_shots", "-")), int(stats.get("max_shots", -1)) if games > 0 else -1),
             ]
-            for c, v in enumerate(vals, start=1):
-                it = QtWidgets.QTableWidgetItem(v)
-                it.setTextAlignment(QtCore.Qt.AlignCenter)
+            for c, (text, sort_val) in enumerate(numeric_vals, start=1):
+                it = SortableTableItem(text, sort_value=sort_val, align=QtCore.Qt.AlignCenter)
                 self.table.setItem(row, c, it)
 
             # Notes column (short)
             note = md.get("notes") or md.get("description") or ""
             if len(note) > 120:
                 note = note[:117] + "..."
-            it_note = QtWidgets.QTableWidgetItem(note)
-            it_note.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            it_note = SortableTableItem(note, sort_value=note, align=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             self.table.setItem(row, 9, it_note)
 
+        self.table.setSortingEnabled(True)
         self.update_summary_label()
 
     def open_model_details(self, row, col):
@@ -1843,6 +1862,7 @@ class ReportCardDialog(QtWidgets.QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(False)
 
         self.table.setRowCount(len(self.model_defs))
 
@@ -1890,9 +1910,11 @@ class ReportCardDialog(QtWidgets.QDialog):
             ]
 
             for col, v in enumerate(vals):
-                it = QtWidgets.QTableWidgetItem(v)
-                if col > 0:
-                    it.setTextAlignment(QtCore.Qt.AlignCenter)
+                if col == 0:
+                    it = SortableTableItem(v, sort_value=v)
+                else:
+                    numeric = float(v) if v != "-" else -1
+                    it = SortableTableItem(v, sort_value=numeric, align=QtCore.Qt.AlignCenter)
                 self.table.setItem(row, col, it)
 
             phase_avgs = []
@@ -1901,8 +1923,8 @@ class ReportCardDialog(QtWidgets.QDialog):
                 phase_avgs.append(f"{avg:.2f}" if avg is not None else "-")
 
             for i, v in enumerate(phase_avgs, start=6):
-                it = QtWidgets.QTableWidgetItem(v)
-                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                numeric = float(v) if v != "-" else -1
+                it = SortableTableItem(v, sort_value=numeric, align=QtCore.Qt.AlignCenter)
                 self.table.setItem(row, i, it)
 
             if best_overall_key == key:
@@ -1918,6 +1940,7 @@ class ReportCardDialog(QtWidgets.QDialog):
                         cell.setForeground(QtGui.QColor(Theme.TEXT_DARK))
 
         layout.addWidget(self.table)
+        self.table.setSortingEnabled(True)
 
         summary = QtWidgets.QLabel()
         if best_overall_key:
