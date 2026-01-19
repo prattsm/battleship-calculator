@@ -55,8 +55,10 @@ def _sample_worlds_with_trace(*args, **kwargs):
 
 
 def _enable_sample_trace(enable: bool) -> None:
-    global _sample_trace_enabled
+    global _sample_trace_enabled, _sample_trace_count
     _sample_trace_enabled = bool(enable)
+    if _sample_trace_enabled:
+        _sample_trace_count = 0
 
 
 def _is_heavy_strategy(strategy: str) -> bool:
@@ -242,6 +244,7 @@ class WorldCache:
         self._seen: set[int] = set()
         self.saturated = False
         self.saturated_N = 0
+        self.no_progress_topups = 0
 
     @property
     def size(self) -> int:
@@ -254,6 +257,7 @@ class WorldCache:
         self._seen = set()
         self.saturated = False
         self.saturated_N = 0
+        self.no_progress_topups = 0
 
     def _update_counts(self, union_mask: int, delta: int) -> None:
         m = union_mask
@@ -278,6 +282,7 @@ class WorldCache:
             if profiler is not None:
                 profiler.record_filter(0.0, 0, 0)
             return 0
+        sunk_flags = [ship_id in confirmed_sunk for ship_id in self.ship_ids] if confirmed_sunk else None
         start = time.perf_counter()
         before_count = len(self.unions)
         filtered_union: List[int] = []
@@ -288,11 +293,19 @@ class WorldCache:
                 removed += 1
                 self._update_counts(union_mask, -1)
                 continue
+            if (union_mask & hit_mask) != hit_mask:
+                removed += 1
+                self._update_counts(union_mask, -1)
+                continue
             ok = True
             for i, req_mask in enumerate(assigned_hit_masks):
                 if req_mask and (req_mask & ~ship_masks_tuple[i]) != 0:
                     ok = False
                     break
+                if sunk_flags and sunk_flags[i]:
+                    if (ship_masks_tuple[i] & ~hit_mask) != 0:
+                        ok = False
+                        break
             if ok:
                 filtered_union.append(union_mask)
                 filtered_masks.append(ship_masks_tuple)
@@ -319,38 +332,65 @@ class WorldCache:
     ) -> Tuple[int, int, int]:
         if tuple(ship_ids) != tuple(self.ship_ids):
             raise AssertionError("ship_ids mismatch for WorldCache")
-        existing_union = self.unions if self.unions else None
-        existing_masks = self.ship_masks if self.ship_masks else None
-        seed_count = len(existing_union) if existing_union is not None else 0
-        sample_start = time.perf_counter()
-        worlds_union, worlds_ship_masks, _, _, N = _sample_worlds_with_trace(
-            board,
-            placements,
-            ship_ids,
-            confirmed_sunk,
-            assigned_hits,
-            rng_seed=rng.randint(0, 2 ** 31 - 1),
-            board_size=self.board_size,
-            target_worlds=target_worlds,
-            max_attempts_factor=max_attempts_factor,
-            existing_union=existing_union,
-            existing_ship_masks=existing_masks,
-            return_ship_masks=True,
-        )
-        sample_time = time.perf_counter() - sample_start
-        if profiler is not None:
-            profiler.record_sample(sample_time, N, topup=bool(existing_union))
+        def run_sample(attempts_factor: Optional[int]) -> Tuple[int, int, int]:
+            existing_union = self.unions if self.unions else None
+            existing_masks = self.ship_masks if self.ship_masks else None
+            seed_count = len(existing_union) if existing_union is not None else 0
+            sample_start = time.perf_counter()
+            worlds_union, worlds_ship_masks, _, _, N = _sample_worlds_with_trace(
+                board,
+                placements,
+                ship_ids,
+                confirmed_sunk,
+                assigned_hits,
+                rng_seed=rng.randint(0, 2 ** 31 - 1),
+                board_size=self.board_size,
+                target_worlds=target_worlds,
+                max_attempts_factor=attempts_factor,
+                existing_union=existing_union,
+                existing_ship_masks=existing_masks,
+                return_ship_masks=True,
+            )
+            sample_time = time.perf_counter() - sample_start
+            if profiler is not None:
+                profiler.record_sample(sample_time, N, topup=bool(existing_union))
 
-        added = 0
-        for union_mask, ship_masks_tuple in zip(worlds_union, worlds_ship_masks):
-            if union_mask in self._seen:
-                continue
-            self._seen.add(union_mask)
-            self.unions.append(union_mask)
-            self.ship_masks.append(ship_masks_tuple)
-            self._update_counts(union_mask, +1)
-            added += 1
-        if added <= 0 or N <= seed_count:
+            added = 0
+            start_idx = 0
+            if seed_count > 0 and len(worlds_union) >= seed_count:
+                head_ok = True
+                for u in worlds_union[:seed_count]:
+                    if u not in self._seen:
+                        head_ok = False
+                        break
+                if head_ok:
+                    start_idx = seed_count
+
+            for union_mask, ship_masks_tuple in zip(worlds_union[start_idx:], worlds_ship_masks[start_idx:]):
+                if union_mask in self._seen:
+                    continue
+                self._seen.add(union_mask)
+                self.unions.append(union_mask)
+                self.ship_masks.append(ship_masks_tuple)
+                self._update_counts(union_mask, +1)
+                added += 1
+            return added, N, seed_count
+
+        added, N, seed_count = run_sample(max_attempts_factor)
+        if added <= 0 and max_attempts_factor is None:
+            retry_factor = _env_int("SIM_TOPUP_RETRY_FACTOR", 60)
+            if retry_factor > 0:
+                added_retry, N_retry, seed_count = run_sample(retry_factor)
+                added += added_retry
+                N = N_retry
+
+        no_progress = (added <= 0 or N <= seed_count)
+        if no_progress:
+            self.no_progress_topups += 1
+        else:
+            self.no_progress_topups = 0
+            self.saturated = False
+        if self.no_progress_topups >= 2:
             self.saturated = True
             self.saturated_N = len(self.unions)
         return added, N, seed_count
@@ -417,14 +457,20 @@ def _simulate_model_game(
     hit_mask = 0
     miss_mask = 0
     log_rng = random.Random()
-    if _env_flag("SIM_TRACE_SAMPLE_CALLS", False):
+    trace_enabled = _env_flag("SIM_TRACE_SAMPLE_CALLS", False)
+    selection_module = None
+    original_selection_sample = None
+    if trace_enabled:
         _enable_sample_trace(True)
         try:
             from battleship.strategies import selection as _selection
 
+            selection_module = _selection
+            original_selection_sample = getattr(_selection, "sample_worlds", None)
             _selection.sample_worlds = _sample_worlds_with_trace
         except Exception:
-            pass
+            selection_module = None
+            original_selection_sample = None
 
     fast_mode = _env_flag("SIM_FAST_MODE", True)
     base_target = _env_int("SIM_TARGET_WORLDS", WORLD_SAMPLE_TARGET)
@@ -449,215 +495,236 @@ def _simulate_model_game(
     if track_phases:
         phase_counts = {PHASE_HUNT: 0, PHASE_TARGET: 0, PHASE_ENDGAME: 0}
 
-    while ships_remaining > 0 and shots < total_cells:
-        current_phase: Optional[str] = None
-        if phase_counts is not None:
-            phase = classify_phase(
-                board,
-                confirmed_sunk,
-                assigned_hits,
-                ship_ids,
-                board_size=board_size,
-            )
-            phase_counts[phase] = phase_counts.get(phase, 0) + 1
-            current_phase = phase
-        elif strategy == "hybrid_phase":
-            current_phase = classify_phase(
-                board,
-                confirmed_sunk,
-                assigned_hits,
-                ship_ids,
-                board_size=board_size,
-            )
-
-        # Pass our "God Mode" knowledge into the bot
-        skip_posterior = False
-        if strategy == "random":
-            skip_posterior = True
-        elif strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
-            if not any(board[r][c] == HIT for r in range(board_size) for c in range(board_size)):
-                skip_posterior = True
-
-        if skip_posterior:
-            unknown_cells = [
-                (r, c)
-                for r in range(board_size)
-                for c in range(board_size)
-                if board[r][c] == EMPTY
-            ]
-            if not unknown_cells:
-                r, c = 0, 0
-            elif strategy == "random":
-                r, c = rng.choice(unknown_cells)
-            elif strategy == "systematic_checkerboard":
-                sorted_cells = sorted(unknown_cells, key=lambda p: (p[0], p[1]))
-                whites = [p for p in sorted_cells if (p[0] + p[1]) % 2 == 0]
-                r, c = whites[0] if whites else sorted_cells[0]
-            elif strategy == "diagonal_stripe":
-                diagonals = [p for p in unknown_cells if (p[0] - p[1]) % 4 == 0]
-                if diagonals:
-                    r, c = rng.choice(diagonals)
-                else:
-                    secondary = [p for p in unknown_cells if (p[0] - p[1]) % 2 == 0]
-                    r, c = rng.choice(secondary) if secondary else rng.choice(unknown_cells)
-            else:
-                whites = [p for p in unknown_cells if (p[0] + p[1]) % 2 == 0]
-                r, c = rng.choice(whites) if whites else rng.choice(unknown_cells)
-            if profiler is not None:
-                profiler.record_posterior_phase(current_phase, used=False)
-        elif fast_mode and world_cache is not None:
-            min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
-            if env_min_keep is not None:
-                min_keep = _env_int("SIM_MIN_KEEP", min_keep)
-            if env_topup_to is not None:
-                if os.getenv("SIM_TOPUP_TO") is not None:
-                    topup_to = _env_int("SIM_TOPUP_TO", topup_to)
-                else:
-                    topup_to = _env_int("SIM_REFILL_TARGET", topup_to)
-            if topup_to > base_target:
-                topup_to = base_target
-            if min_keep > topup_to:
-                min_keep = topup_to
-            n_before_filter = world_cache.size
-            world_cache.filter_in_place(
-                miss_mask,
-                assigned_hit_masks,
-                hit_mask,
-                confirmed_sunk,
-                profiler=profiler,
-            )
-            n_after_filter = world_cache.size
-            if world_cache.size == 0:
-                world_cache.clear()
-            if world_cache.saturated:
-                if profiler is not None:
-                    profiler.record_posterior_phase(current_phase, used=True)
-            elif world_cache.size < min_keep:
-                if profiler is not None:
-                    profiler.record_topup(
-                        n_before=world_cache.size,
-                        current_shot=shots,
-                        reason_lowN=True,
-                        reason_empty=(world_cache.size == 0),
-                        reason_strategy_full=_is_heavy_strategy(strategy),
-                    )
-                start_size = world_cache.size
-                desired = topup_to
-                added, n_returned, seed_count = world_cache.top_up(
+    try:
+        while ships_remaining > 0 and shots < total_cells:
+            current_phase: Optional[str] = None
+            if phase_counts is not None:
+                phase = classify_phase(
                     board,
-                    sim_placements,
-                    ship_ids,
                     confirmed_sunk,
                     assigned_hits,
-                    rng,
-                    target_worlds=desired,
-                    max_attempts_factor=None,
+                    ship_ids,
+                    board_size=board_size,
+                )
+                phase_counts[phase] = phase_counts.get(phase, 0) + 1
+                current_phase = phase
+            elif strategy == "hybrid_phase":
+                current_phase = classify_phase(
+                    board,
+                    confirmed_sunk,
+                    assigned_hits,
+                    ship_ids,
+                    board_size=board_size,
+                )
+
+            # Pass our "God Mode" knowledge into the bot
+            skip_posterior = False
+            if strategy == "random":
+                skip_posterior = True
+            elif strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
+                if not any(board[r][c] == HIT for r in range(board_size) for c in range(board_size)):
+                    skip_posterior = True
+
+            posterior_used = False
+            if skip_posterior:
+                unknown_cells = [
+                    (r, c)
+                    for r in range(board_size)
+                    for c in range(board_size)
+                    if board[r][c] == EMPTY
+                ]
+                if not unknown_cells:
+                    r, c = 0, 0
+                elif strategy == "random":
+                    r, c = rng.choice(unknown_cells)
+                elif strategy == "systematic_checkerboard":
+                    sorted_cells = sorted(unknown_cells, key=lambda p: (p[0], p[1]))
+                    whites = [p for p in sorted_cells if (p[0] + p[1]) % 2 == 0]
+                    r, c = whites[0] if whites else sorted_cells[0]
+                elif strategy == "diagonal_stripe":
+                    diagonals = [p for p in unknown_cells if (p[0] - p[1]) % 4 == 0]
+                    if diagonals:
+                        r, c = rng.choice(diagonals)
+                    else:
+                        secondary = [p for p in unknown_cells if (p[0] - p[1]) % 2 == 0]
+                        r, c = rng.choice(secondary) if secondary else rng.choice(unknown_cells)
+                else:
+                    whites = [p for p in unknown_cells if (p[0] + p[1]) % 2 == 0]
+                    r, c = rng.choice(whites) if whites else rng.choice(unknown_cells)
+            elif fast_mode and world_cache is not None:
+                min_keep, topup_to = _default_topup_targets(strategy, current_phase, base_target)
+                if env_min_keep is not None:
+                    min_keep = _env_int("SIM_MIN_KEEP", min_keep)
+                if env_topup_to is not None:
+                    if os.getenv("SIM_TOPUP_TO") is not None:
+                        topup_to = _env_int("SIM_TOPUP_TO", topup_to)
+                    else:
+                        topup_to = _env_int("SIM_REFILL_TARGET", topup_to)
+                if topup_to > base_target:
+                    topup_to = base_target
+                if min_keep > topup_to:
+                    min_keep = topup_to
+                n_before_filter = world_cache.size
+                world_cache.filter_in_place(
+                    miss_mask,
+                    assigned_hit_masks,
+                    hit_mask,
+                    confirmed_sunk,
                     profiler=profiler,
                 )
-                if profiler is not None and log_rng.random() < 0.01:
-                    print(
-                        "[SIM_PROFILE_DETAIL] topup",
-                        f"N_before_filter={n_before_filter}",
-                        f"N_after_filter={n_after_filter}",
-                        f"N_before_topup={start_size}",
-                        f"MIN_KEEP={min_keep}",
-                        f"TOPUP_TO={topup_to}",
-                        f"target_worlds={desired}",
-                        "max_attempts_factor=default",
-                        f"existing_empty={seed_count == 0}",
-                        f"N_returned={n_returned}",
-                        f"num_added={added}",
-                        f"seed_count={seed_count}",
-                        f"seen_union_size={len(world_cache._seen)}",
+                n_after_filter = world_cache.size
+                if world_cache.size == 0:
+                    world_cache.clear()
+                if not world_cache.saturated and world_cache.size < min_keep:
+                    if profiler is not None:
+                        profiler.record_topup(
+                            n_before=world_cache.size,
+                            current_shot=shots,
+                            reason_lowN=True,
+                            reason_empty=(world_cache.size == 0),
+                            reason_strategy_full=_is_heavy_strategy(strategy),
+                        )
+                    start_size = world_cache.size
+                    desired = topup_to
+                    added, n_returned, seed_count = world_cache.top_up(
+                        board,
+                        sim_placements,
+                        ship_ids,
+                        confirmed_sunk,
+                        assigned_hits,
+                        rng,
+                        target_worlds=desired,
+                        max_attempts_factor=None,
+                        profiler=profiler,
                     )
-            posterior = world_cache.posterior()
+                    if profiler is not None and log_rng.random() < 0.01:
+                        print(
+                            "[SIM_PROFILE_DETAIL] topup",
+                            f"N_before_filter={n_before_filter}",
+                            f"N_after_filter={n_after_filter}",
+                            f"N_before_topup={start_size}",
+                            f"MIN_KEEP={min_keep}",
+                            f"TOPUP_TO={topup_to}",
+                            f"target_worlds={desired}",
+                            "max_attempts_factor=default",
+                            f"existing_empty={seed_count == 0}",
+                            f"N_returned={n_returned}",
+                            f"num_added={added}",
+                            f"seed_count={seed_count}",
+                            f"seen_union_size={len(world_cache._seen)}",
+                        )
+                posterior = world_cache.posterior()
+                posterior_used = True
+                selection_start = time.perf_counter()
+                r, c = _choose_next_shot_for_strategy(
+                    strategy,
+                    board,
+                    sim_placements,
+                    rng,
+                    ship_ids,
+                    board_size,
+                    known_sunk=confirmed_sunk,
+                    known_assigned=assigned_hits,
+                    params=params,
+                    posterior=posterior,
+                )
+                if profiler is not None:
+                    profiler.record_selection(time.perf_counter() - selection_start)
+            else:
+                selection_start = time.perf_counter()
+                r, c = _choose_next_shot_for_strategy(
+                    strategy,
+                    board,
+                    sim_placements,
+                    rng,
+                    ship_ids,
+                    board_size,
+                    known_sunk=confirmed_sunk,
+                    known_assigned=assigned_hits,
+                    params=params,
+                    profiler=profiler,
+                )
+                if profiler is not None:
+                    sample_time = profiler.consume_last_sample_time()
+                    profiler.record_selection(time.perf_counter() - selection_start, sample_time=sample_time)
+                posterior_used = True
+
             if profiler is not None:
-                profiler.record_posterior_phase(current_phase, used=True)
-            selection_start = time.perf_counter()
-            r, c = _choose_next_shot_for_strategy(
-                strategy,
-                board,
-                sim_placements,
-                rng,
-                ship_ids,
-                board_size,
-                known_sunk=confirmed_sunk,
-                known_assigned=assigned_hits,
-                params=params,
-                posterior=posterior,
-            )
+                profiler.record_posterior_call()
+                profiler.record_posterior_phase(current_phase, used=posterior_used)
+
+            if board[r][c] != EMPTY:
+                if _env_flag("SIM_DEBUG_STATS", False):
+                    assert board[r][c] == EMPTY, "Selected a non-empty cell"
+                fallback = [
+                    (rr, cc)
+                    for rr in range(board_size)
+                    for cc in range(board_size)
+                    if board[rr][cc] == EMPTY
+                ]
+                if fallback:
+                    r, c = rng.choice(fallback)
+
+            idx = cell_index(r, c, board_size)
+            is_hit = (used_mask >> idx) & 1
+
+            board[r][c] = HIT if is_hit else MISS
+            shots += 1
             if profiler is not None:
-                profiler.record_selection(time.perf_counter() - selection_start)
-        else:
-            selection_start = time.perf_counter()
-            r, c = _choose_next_shot_for_strategy(
-                strategy,
-                board,
-                sim_placements,
-                rng,
-                ship_ids,
-                board_size,
-                known_sunk=confirmed_sunk,
-                known_assigned=assigned_hits,
-                params=params,
-                profiler=profiler,
-            )
-            if profiler is not None:
-                sample_time = profiler.consume_last_sample_time()
-                profiler.record_selection(time.perf_counter() - selection_start, sample_time=sample_time)
+                profiler.record_shot()
+            if is_hit:
+                hit_mask |= 1 << idx
+            else:
+                miss_mask |= 1 << idx
 
-        if profiler is not None:
-            profiler.record_posterior_call()
+            if is_hit:
+                # Identify which ship was hit
+                hit_ship = cell_to_ship[(r, c)]
 
-        idx = cell_index(r, c, board_size)
-        is_hit = (used_mask >> idx) & 1
-
-        board[r][c] = HIT if is_hit else MISS
-        shots += 1
-        if profiler is not None:
-            profiler.record_shot()
-        if is_hit:
-            hit_mask |= 1 << idx
-        else:
-            miss_mask |= 1 << idx
-
-        if is_hit:
-            # Identify which ship was hit
-            hit_ship = cell_to_ship[(r, c)]
-
-            # FEATURE 1: Auto-Assign Hits (Perfect Play)
-            # The bot "knows" which ship it hit.
-            assigned_hits[hit_ship].add((r, c))
-            ship_idx = ship_index.get(hit_ship)
-            if ship_idx is not None:
-                assigned_hit_masks[ship_idx] |= 1 << idx
-
-            # FEATURE 2: Auto-Mark Sunk (Standard Rules)
-            # Check if this ship is now fully sunk
-            ship_cells = true_layout[hit_ship].cells
-            is_sunk = all(board[sr][sc] == HIT for sr, sc in ship_cells)
-
-            if is_sunk and hit_ship not in confirmed_sunk:
-                confirmed_sunk.add(hit_ship)
-                ships_remaining -= 1
+                # FEATURE 1: Auto-Assign Hits (Perfect Play)
+                # The bot "knows" which ship it hit.
+                assigned_hits[hit_ship].add((r, c))
                 ship_idx = ship_index.get(hit_ship)
                 if ship_idx is not None:
-                    assigned_hits[hit_ship] = set(true_layout[hit_ship].cells)
-                    assigned_hit_masks[ship_idx] = true_layout[hit_ship].mask
-                    if _env_flag("SIM_DEBUG_ASSERTS", False):
-                        assert assigned_hit_masks[ship_idx] == true_layout[hit_ship].mask
-                        assert (assigned_hit_masks[ship_idx] & ~hit_mask) == 0
-                if hit_ship not in frozen_ships:
-                    if sim_placements is placements:
-                        sim_placements = dict(placements)
-                    sim_placements[hit_ship] = [true_layout[hit_ship]]
-                    frozen_ships.add(hit_ship)
+                    assigned_hit_masks[ship_idx] |= 1 << idx
 
+                # FEATURE 2: Auto-Mark Sunk (Standard Rules)
+                # Check if this ship is now fully sunk
+                ship_cells = true_layout[hit_ship].cells
+                is_sunk = all(board[sr][sc] == HIT for sr, sc in ship_cells)
+
+                if is_sunk and hit_ship not in confirmed_sunk:
+                    confirmed_sunk.add(hit_ship)
+                    ships_remaining -= 1
+                    ship_idx = ship_index.get(hit_ship)
+                    if ship_idx is not None:
+                        assigned_hits[hit_ship] = set(true_layout[hit_ship].cells)
+                        assigned_hit_masks[ship_idx] = true_layout[hit_ship].mask
+                        if _env_flag("SIM_DEBUG_ASSERTS", False):
+                            assert assigned_hit_masks[ship_idx] == true_layout[hit_ship].mask
+                            assert (assigned_hit_masks[ship_idx] & ~hit_mask) == 0
+                    if hit_ship not in frozen_ships:
+                        if sim_placements is placements:
+                            sim_placements = dict(placements)
+                        sim_placements[hit_ship] = [true_layout[hit_ship]]
+                        frozen_ships.add(hit_ship)
+
+    finally:
+        if trace_enabled:
+            _enable_sample_trace(False)
+            if selection_module is not None and original_selection_sample is not None:
+                try:
+                    selection_module.sample_worlds = original_selection_sample
+                except Exception:
+                    pass
     if profiler is not None:
         profiler.record_game()
         if track_phases and _env_flag("SIM_DEBUG_STATS", False):
             total_phase = sum(phase_counts.values()) if phase_counts else 0
             assert total_phase == shots, "Phase counts must sum to shots in sim"
+            used = sum(profiler.posterior_used_by_phase.values())
+            skipped = sum(profiler.posterior_skipped_by_phase.values())
+            assert used + skipped == profiler.posterior_calls, "Posterior phase counts must match calls"
     return shots, phase_counts
 
 
