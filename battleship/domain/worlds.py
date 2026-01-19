@@ -270,6 +270,7 @@ def sample_worlds(
     existing_ship_masks: Optional[List[Tuple[int, ...]]] = None,
     return_ship_masks: bool = False,
     placement_index: Optional[Dict[str, Dict[int, List[int]]]] = None,
+    allow_parallel: bool = True,
 ) -> Union[
     Tuple[List[int], List[int], Dict[str, float], int],
     Tuple[List[int], List[Tuple[int, ...]], List[int], Dict[str, float], int],
@@ -381,7 +382,7 @@ def sample_worlds(
                 except Exception:
                     use_parallel = False
 
-        if use_parallel and needed > 0:
+        if allow_parallel and use_parallel and needed > 0:
             workers = min(os.cpu_count() or 1, 4)
             per_worker = max(1, int(math.ceil(needed / workers)))
             per_attempts = max(1, per_worker * factor)

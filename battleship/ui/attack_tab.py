@@ -42,6 +42,404 @@ from battleship.strategies.registry import model_defs
 from battleship.ui.theme import Theme
 
 
+class _AttackRecomputeSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, dict)
+    error = QtCore.pyqtSignal(int, str)
+
+
+class _AttackRecomputeTask(QtCore.QRunnable):
+    def __init__(self, job_id: int, payload: dict):
+        super().__init__()
+        self.job_id = int(job_id)
+        self.payload = payload
+        self.signals = _AttackRecomputeSignals()
+
+    def run(self) -> None:
+        try:
+            result = _compute_attack_recompute(self.payload)
+            self.signals.finished.emit(self.job_id, result)
+        except Exception as exc:
+            self.signals.error.emit(self.job_id, str(exc))
+
+
+class _WinPredictionSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, object)
+    error = QtCore.pyqtSignal(int, str)
+
+
+class _WinPredictionTask(QtCore.QRunnable):
+    def __init__(self, job_id: int, payload: dict):
+        super().__init__()
+        self.job_id = int(job_id)
+        self.payload = payload
+        self.signals = _WinPredictionSignals()
+
+    def run(self) -> None:
+        try:
+            result = _compute_win_prediction_snapshot(self.payload)
+            self.signals.finished.emit(self.job_id, result)
+        except Exception as exc:
+            self.signals.error.emit(self.job_id, str(exc))
+
+
+def _compute_attack_recompute(payload: dict) -> dict:
+    board = payload["board"]
+    board_size = payload["board_size"]
+    placements = payload["placements"]
+    ship_ids = payload["ship_ids"]
+    confirmed_sunk = payload["confirmed_sunk"]
+    assigned_hits = payload["assigned_hits"]
+    cell_prior = payload.get("cell_prior")
+    placement_index = payload.get("placement_index")
+    target_worlds = payload.get("target_worlds", WORLD_SAMPLE_TARGET)
+    prev_cache_key = payload.get("cache_key")
+    prev_world_masks = payload.get("world_masks") or []
+    prev_world_ship_masks = payload.get("world_ship_masks") or []
+    compute_two_ply = bool(payload.get("compute_two_ply", False))
+
+    hit_mask, miss_mask = board_masks(board, board_size)
+    assigned_masks = tuple(
+        make_mask(list(assigned_hits.get(ship, set())), board_size)
+        if assigned_hits.get(ship)
+        else 0
+        for ship in ship_ids
+    )
+    confirmed_key = tuple(sorted(confirmed_sunk))
+    prior_key = payload.get("prior_key")
+    cache_key = (hit_mask, miss_mask, confirmed_key, assigned_masks, prior_key, target_worlds)
+
+    reuse_prior = False
+    can_reuse = False
+    if prev_cache_key is not None and len(prev_cache_key) >= 6:
+        reuse_prior = (prev_cache_key[4] == prior_key)
+        try:
+            prev_hit, prev_miss, prev_confirmed, prev_assigned, _prev_prior, _prev_target = prev_cache_key
+            prev_confirmed_set = set(prev_confirmed)
+            new_confirmed_set = set(confirmed_key)
+            hits_stricter = (hit_mask | prev_hit) == hit_mask
+            misses_stricter = (miss_mask | prev_miss) == miss_mask
+            confirmed_stricter = prev_confirmed_set.issubset(new_confirmed_set)
+            assigned_stricter = True
+            if isinstance(prev_assigned, tuple) and len(prev_assigned) == len(assigned_masks):
+                for prev_mask, new_mask in zip(prev_assigned, assigned_masks):
+                    if prev_mask & ~new_mask:
+                        assigned_stricter = False
+                        break
+            else:
+                assigned_stricter = False
+            can_reuse = reuse_prior and hits_stricter and misses_stricter and confirmed_stricter and assigned_stricter
+        except Exception:
+            can_reuse = False
+
+    filtered_union = None
+    filtered_masks = None
+    if can_reuse and prev_world_ship_masks:
+        filtered_union, filtered_masks = filter_worlds_by_constraints(
+            prev_world_masks,
+            prev_world_ship_masks,
+            ship_ids,
+            hit_mask,
+            miss_mask,
+            confirmed_sunk,
+            assigned_masks,
+        )
+
+    if cache_key != prev_cache_key:
+        if filtered_union is not None and filtered_masks is not None and len(filtered_union) >= target_worlds:
+            world_masks = filtered_union[:target_worlds]
+            world_ship_masks = filtered_masks[:target_worlds]
+            cell_hit_counts, ship_sunk_probs = summarize_worlds(
+                world_masks,
+                world_ship_masks,
+                ship_ids,
+                hit_mask,
+                board_size,
+                confirmed_sunk=confirmed_sunk,
+            )
+            num_world_samples = len(world_masks)
+        else:
+            existing_union = filtered_union if filtered_union is not None else None
+            existing_masks = filtered_masks if filtered_masks is not None else None
+            (
+                world_masks,
+                world_ship_masks,
+                cell_hit_counts,
+                ship_sunk_probs,
+                num_world_samples,
+            ) = sample_worlds(
+                board,
+                placements,
+                ship_ids,
+                confirmed_sunk,
+                assigned_hits,
+                board_size=board_size,
+                cell_prior=cell_prior,
+                target_worlds=target_worlds,
+                existing_union=existing_union,
+                existing_ship_masks=existing_masks,
+                return_ship_masks=True,
+                placement_index=placement_index,
+                allow_parallel=False,
+            )
+    else:
+        world_masks = prev_world_masks
+        world_ship_masks = prev_world_ship_masks
+        num_world_samples = len(prev_world_masks)
+        if num_world_samples > 0:
+            cell_hit_counts, ship_sunk_probs = summarize_worlds(
+                world_masks,
+                world_ship_masks,
+                ship_ids,
+                hit_mask,
+                board_size,
+                confirmed_sunk=confirmed_sunk,
+            )
+        else:
+            cell_hit_counts = [0] * (board_size * board_size)
+            ship_sunk_probs = {s: 0.0 for s in ship_ids}
+
+    N = num_world_samples
+    if N > 0:
+        cell_probs = [cnt / N for cnt in cell_hit_counts]
+        max_gain = 0.0
+        info_vals = [0.0] * (board_size * board_size)
+        for idx in range(board_size * board_size):
+            n_hit = cell_hit_counts[idx]
+            n_miss = N - n_hit
+            gain = N - (n_hit * n_hit + n_miss * n_miss) / N
+            info_vals[idx] = gain
+            if gain > max_gain:
+                max_gain = gain
+        if max_gain > 0:
+            info_vals = [v / max_gain for v in info_vals]
+    else:
+        cell_probs = [0.0] * (board_size * board_size)
+        info_vals = [0.0] * (board_size * board_size)
+
+    # Determine enumeration mode (matches sample_worlds logic)
+    if N > 0:
+        remaining_ships = [s for s in ship_ids if s not in confirmed_sunk]
+        remaining_ship_count = len(remaining_ships)
+        allowed = filter_allowed_placements(
+            placements,
+            hit_mask,
+            miss_mask,
+            confirmed_sunk,
+            assigned_hits,
+            board_size,
+            placement_index=placement_index,
+        )
+        force_enumeration = (remaining_ship_count == 1)
+        product = 1
+        enumeration = True
+        if not force_enumeration:
+            for ship in ship_ids:
+                n = len(allowed[ship])
+                product *= n
+                if product > ENUMERATION_PRODUCT_LIMIT:
+                    enumeration = False
+                    break
+        else:
+            enumeration = True
+        if cell_prior is not None:
+            enumeration = False
+    else:
+        enumeration = False
+        remaining_ship_count = len([s for s in ship_ids if s not in confirmed_sunk])
+
+    two_ply_cells: List[Tuple[int, int]] = []
+    two_ply_prob = 0.0
+    if compute_two_ply and N > 0:
+        _info_vals, best_indices, best_p = two_ply_selection(
+            board,
+            world_masks,
+            cell_hit_counts,
+            board_size,
+        )
+        two_ply_cells = [(idx // board_size, idx % board_size) for idx in best_indices]
+        two_ply_prob = best_p
+
+    return {
+        "cache_key": cache_key,
+        "world_masks": world_masks,
+        "world_ship_masks": world_ship_masks,
+        "cell_hit_counts": cell_hit_counts,
+        "ship_sunk_probs": ship_sunk_probs,
+        "num_world_samples": N,
+        "cell_probs": cell_probs,
+        "info_gain_values": info_vals,
+        "enumeration_mode": enumeration,
+        "remaining_ship_count": remaining_ship_count,
+        "two_ply_cells": two_ply_cells,
+        "two_ply_prob": two_ply_prob,
+    }
+
+
+def _compute_win_prediction_snapshot(payload: dict) -> Optional[Tuple[float, float, float]]:
+    board = payload["board"]
+    board_size = payload["board_size"]
+    world_masks = payload["world_masks"]
+    cell_probs = payload["cell_probs"]
+    defense_layout_board = payload.get("defense_layout_board")
+    defense_shot_board = payload.get("defense_shot_board")
+    hit_counts_phase = payload.get("defense_hit_counts_phase")
+    miss_counts_phase = payload.get("defense_miss_counts_phase")
+    disp_counts = payload.get("defense_disp_counts")
+
+    if not world_masks or defense_layout_board is None:
+        return None
+
+    rng = random.Random()
+    sample_worlds_list = rng.sample(world_masks, min(6, len(world_masks)))
+
+    unknown_cells = []
+    for r in range(board_size):
+        for c in range(board_size):
+            if board[r][c] == EMPTY:
+                unknown_cells.append((r, c))
+    if not unknown_cells or not cell_probs or len(cell_probs) != board_size * board_size:
+        return None
+
+    known_hit_mask = 0
+    for r in range(board_size):
+        for c in range(board_size):
+            if board[r][c] == HIT:
+                known_hit_mask |= 1 << cell_index(r, c, board_size)
+
+    def pick_best_unknown(sim_board, candidates=None):
+        best = None
+        best_p = -1.0
+        if candidates is None:
+            for rr in range(board_size):
+                for cc in range(board_size):
+                    if sim_board[rr][cc] != EMPTY:
+                        continue
+                    idx = cell_index(rr, cc, board_size)
+                    p = cell_probs[idx]
+                    if p > best_p + 1e-12:
+                        best_p = p
+                        best = (rr, cc)
+                    elif best is not None and abs(p - best_p) <= 1e-12 and rng.random() < 0.5:
+                        best = (rr, cc)
+        else:
+            for rr, cc in candidates:
+                if sim_board[rr][cc] != EMPTY:
+                    continue
+                idx = cell_index(rr, cc, board_size)
+                p = cell_probs[idx]
+                if p > best_p + 1e-12:
+                    best_p = p
+                    best = (rr, cc)
+                elif best is not None and abs(p - best_p) <= 1e-12 and rng.random() < 0.5:
+                    best = (rr, cc)
+        return best
+
+    def simulate_fast(w_mask: int) -> int:
+        sim_board = [row[:] for row in board]
+        remaining = (w_mask & ~known_hit_mask).bit_count()
+        if remaining <= 0:
+            return 0
+
+        frontier = set()
+        for rr in range(board_size):
+            for cc in range(board_size):
+                if sim_board[rr][cc] != HIT:
+                    continue
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr = rr + dr
+                    nc = cc + dc
+                    if 0 <= nr < board_size and 0 <= nc < board_size:
+                        if sim_board[nr][nc] == EMPTY:
+                            frontier.add((nr, nc))
+
+        shots = 0
+        max_shots = len(unknown_cells)
+        while remaining > 0 and shots < max_shots:
+            cell = pick_best_unknown(sim_board, frontier if frontier else None)
+            if cell is None:
+                break
+            r, c = cell
+            idx = cell_index(r, c, board_size)
+            is_hit = (w_mask >> idx) & 1
+            sim_board[r][c] = HIT if is_hit else MISS
+            shots += 1
+            if (r, c) in frontier:
+                frontier.discard((r, c))
+            if is_hit:
+                remaining -= 1
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr = r + dr
+                    nc = c + dc
+                    if 0 <= nr < board_size and 0 <= nc < board_size:
+                        if sim_board[nr][nc] == EMPTY:
+                            frontier.add((nr, nc))
+        if remaining > 0 and shots >= max_shots:
+            shots += remaining
+        return shots
+
+    my_rem_samples = [simulate_fast(w_mask) for w_mask in sample_worlds_list]
+    if not my_rem_samples:
+        return None
+    my_avg_rem = sum(my_rem_samples) / len(my_rem_samples)
+    my_total = (sum(row.count(HIT) + row.count(MISS) for row in board)) + my_avg_rem
+
+    layout_mask = 0
+    for r in range(board_size):
+        for c in range(board_size):
+            if defense_layout_board[r][c] == HAS_SHIP:
+                layout_mask |= (1 << cell_index(r, c, board_size))
+
+    if hit_counts_phase is None or miss_counts_phase is None or disp_counts is None:
+        return None
+    base_heat = [
+        build_base_heat(hit_counts_phase[p], miss_counts_phase[p], board_size)
+        for p in range(4)
+    ]
+
+    opp_rem_samples = []
+    for _ in range(10):
+        s_taken, _ = simulate_enemy_game_phase(
+            layout_mask,
+            base_heat,
+            disp_counts,
+            "seq",
+            rng,
+            board_size=board_size,
+            initial_shot_board=defense_shot_board,
+        )
+        opp_rem_samples.append(s_taken)
+
+    if not opp_rem_samples:
+        return None
+    opp_avg = sum(opp_rem_samples) / len(opp_rem_samples)
+
+    wins = 0
+    total_comps = 0
+    for m in my_rem_samples:
+        m_tot = (sum(row.count(HIT) + row.count(MISS) for row in board)) + m
+        for o in opp_rem_samples:
+            if m_tot < o:
+                wins += 1
+            total_comps += 1
+
+    prob = (wins / total_comps) * 100 if total_comps else 0
+
+    my_shots = sum(row.count(HIT) + row.count(MISS) for row in board)
+    opp_shots = sum(
+        row.count(SHOT_HIT) + row.count(SHOT_MISS) for row in defense_shot_board
+    )
+    shot_diff = my_shots - opp_shots
+    baseline = 50.0 - (4.0 * shot_diff)
+    baseline = max(5.0, min(95.0, baseline))
+    total_shots = my_shots + opp_shots
+    denom = max(10.0, float(board_size) * 1.5)
+    weight = min(1.0, total_shots / denom)
+    adj_prob = baseline + weight * (prob - baseline)
+    adj_prob = max(0.0, min(100.0, adj_prob))
+
+    return float(adj_prob), float(my_total), float(opp_avg)
+
+
 class AttackTab(QtWidgets.QWidget):
     shot_recorded = QtCore.pyqtSignal()
     state_updated = QtCore.pyqtSignal()
@@ -119,6 +517,26 @@ class AttackTab(QtWidgets.QWidget):
         self.world_ship_masks: List[Tuple[int, ...]] = []
         self._placement_index = build_placement_index(self.placements, self.board_size)
 
+        # Async recompute state
+        self._recompute_timer = QtCore.QTimer(self)
+        self._recompute_timer.setSingleShot(True)
+        self._recompute_timer.setInterval(120)
+        self._recompute_timer.timeout.connect(self._start_recompute_job)
+        self._recompute_job_seq = 0
+        self._recompute_running = False
+        self._recompute_pending = False
+        self._pending_full_redraw = False
+        self._last_recompute_request: Optional[dict] = None
+
+        # Async win prediction
+        self._win_pred_timer = QtCore.QTimer(self)
+        self._win_pred_timer.setSingleShot(True)
+        self._win_pred_timer.setInterval(150)
+        self._win_pred_timer.timeout.connect(self._start_win_prediction_job)
+        self._win_pred_job_seq = 0
+        self._win_pred_running = False
+        self._last_win_pred_request: Optional[dict] = None
+
         # Lookahead rollouts
         self.rollout_enabled: bool = False
         self.rollout_count: int = 16
@@ -137,7 +555,7 @@ class AttackTab(QtWidgets.QWidget):
         self._update_model_controls()
         self._update_history_buttons()
         self.load_state()
-        self.recompute()
+        self._schedule_recompute(immediate=True)
 
     def _board_cell_size(self) -> int:
         base = 520
@@ -868,7 +1286,7 @@ class AttackTab(QtWidgets.QWidget):
         self.rollout_count = int(self.rollout_count_spin.value())
         self.rollout_top_k = int(self.rollout_top_spin.value())
         self.save_state()
-        self.recompute()
+        self._schedule_recompute()
 
     def _rollout_budget(self, unknown_cells_count: int) -> Dict[str, object]:
         total_cells = self.board_size * self.board_size
@@ -1084,7 +1502,8 @@ class AttackTab(QtWidgets.QWidget):
             cb.blockSignals(False)
 
         self._suspend_history = False
-        self.recompute()
+        self.update_board_view()
+        self._schedule_recompute(immediate=True)
 
     def _push_history(self):
         if self._suspend_history:
@@ -1153,7 +1572,8 @@ class AttackTab(QtWidgets.QWidget):
         elif new_state != HIT:
             for ship in self.ship_ids:
                 self.assigned_hits[ship].discard((r, c))
-        self.recompute()
+        self._update_cells_view([(r, c)])
+        self._schedule_recompute()
 
     def _toggle_assignment(self, ship: str, r: int, c: int):
         sset = self.assigned_hits[ship]
@@ -1883,6 +2303,7 @@ class AttackTab(QtWidgets.QWidget):
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._update_history_buttons()
+        self.update_board_view()
 
     def _record_game_result(self, win: bool):
         self.stats.record_game(win)
@@ -1923,7 +2344,8 @@ class AttackTab(QtWidgets.QWidget):
             ):
                 self._push_history()
                 self._toggle_assignment(self.assign_mode_ship, r, c)
-                self.recompute()
+                self._update_cells_view([(r, c)])
+                self._schedule_recompute()
                 return
 
             if modifiers & QtCore.Qt.ShiftModifier:
@@ -1952,7 +2374,7 @@ class AttackTab(QtWidgets.QWidget):
                 self.confirmed_sunk.add(ship)
             else:
                 self.confirmed_sunk.discard(ship)
-            self.recompute()
+            self._schedule_recompute()
 
         return handler
 
@@ -1974,7 +2396,8 @@ class AttackTab(QtWidgets.QWidget):
             self.lock_model_cb.setChecked(False)
             self.lock_model_cb.blockSignals(False)
         self.locked_model_key = None
-        self.recompute()
+        self.update_board_view()
+        self._schedule_recompute(immediate=True)
 
         # Persist cleared board without dropping opponent history.
         self.save_state()
@@ -1986,16 +2409,10 @@ class AttackTab(QtWidgets.QWidget):
     # In AttackTab class, add the prediction logic:
     def update_win_prediction(self, defense_tab):
         """Simulate Me vs Opponent."""
+        self.linked_defense_tab = defense_tab
         if not hasattr(self, "win_prob_label"):
             return
-        result = self.compute_win_prediction(defense_tab)
-        if result is None:
-            self.win_prob_label.setText("Win Prob: N/A (Need Defense Layout)")
-            return
-        prob, my_total, opp_avg = result
-        self.win_prob_label.setText(
-            f"Win Probability: {prob:.1f}% (Me: ~{my_total:.1f} vs Opp: ~{opp_avg:.1f})"
-        )
+        self._schedule_win_prediction()
 
     def compute_win_prediction(self, defense_tab) -> Optional[Tuple[float, float, float]]:
         """Return (win_pct, my_total, opp_avg) or None if unavailable."""
@@ -2164,169 +2581,121 @@ class AttackTab(QtWidgets.QWidget):
         return float(adj_prob), float(my_total), float(opp_avg)
 
     def recompute(self, defense_tab=None):
-        # Rebuild world samples and ship-sunk probabilities
+        if defense_tab is not None:
+            self.linked_defense_tab = defense_tab
+        self._schedule_recompute(immediate=True)
+
+    def _schedule_recompute(self, immediate: bool = False) -> None:
+        self._recompute_pending = True
+        self._mark_recompute_pending()
+        if immediate:
+            self._recompute_timer.start(0)
+        else:
+            self._recompute_timer.start()
+
+    def _mark_recompute_pending(self) -> None:
+        try:
+            if hasattr(self, "best_label"):
+                self.best_label.setText("Best guess: updating…")
+            if hasattr(self, "world_mode_label"):
+                self.world_mode_label.setText("World model: updating…")
+        except Exception:
+            pass
+
+    def _build_recompute_request(self) -> dict:
+        board_copy = [row[:] for row in self.board]
+        assigned_hits_copy = {s: set(coords) for s, coords in self.assigned_hits.items()}
+        confirmed_sunk_copy = set(self.confirmed_sunk)
+
         cell_prior = self._compute_opponent_prior()
-        hit_mask, miss_mask = board_masks(self.board, self.board_size)
-        assigned_masks = tuple(
-            make_mask(list(self.assigned_hits.get(ship, set())), self.board_size)
-            if self.assigned_hits.get(ship)
-            else 0
-            for ship in self.ship_ids
-        )
-        confirmed_key = tuple(sorted(self.confirmed_sunk))
         prior_key = None
         if cell_prior is not None:
             prior_key = tuple(int(v) for v in self.opponent_cell_counts)
-        target_worlds = WORLD_SAMPLE_TARGET
-        cache_key = (hit_mask, miss_mask, confirmed_key, assigned_masks, prior_key, target_worlds)
-        reuse_prior = False
-        can_reuse = False
-        if self._world_cache_key is not None and len(self._world_cache_key) >= 6:
-            reuse_prior = (self._world_cache_key[4] == prior_key)
-            try:
-                prev_hit, prev_miss, prev_confirmed, prev_assigned, _prev_prior, _prev_target = (
-                    self._world_cache_key
-                )
-                prev_confirmed_set = set(prev_confirmed)
-                new_confirmed_set = set(confirmed_key)
-                hits_stricter = (hit_mask | prev_hit) == hit_mask
-                misses_stricter = (miss_mask | prev_miss) == miss_mask
-                confirmed_stricter = prev_confirmed_set.issubset(new_confirmed_set)
-                assigned_stricter = True
-                if isinstance(prev_assigned, tuple) and len(prev_assigned) == len(assigned_masks):
-                    for prev_mask, new_mask in zip(prev_assigned, assigned_masks):
-                        if prev_mask & ~new_mask:
-                            assigned_stricter = False
-                            break
-                else:
-                    assigned_stricter = False
-                can_reuse = reuse_prior and hits_stricter and misses_stricter and confirmed_stricter and assigned_stricter
-            except Exception:
-                can_reuse = False
 
-        filtered_union: Optional[List[int]] = None
-        filtered_masks: Optional[List[Tuple[int, ...]]] = None
-        if can_reuse and self.world_ship_masks:
-            filtered_union, filtered_masks = filter_worlds_by_constraints(
-                self.world_masks,
-                self.world_ship_masks,
-                self.ship_ids,
-                hit_mask,
-                miss_mask,
-                self.confirmed_sunk,
-                assigned_masks,
-            )
-
-        if cache_key != self._world_cache_key:
-            if filtered_union is not None and filtered_masks is not None and len(filtered_union) >= target_worlds:
-                self.world_masks = filtered_union[:target_worlds]
-                self.world_ship_masks = filtered_masks[:target_worlds]
-                self.cell_hit_counts, self.ship_sunk_probs = summarize_worlds(
-                    self.world_masks,
-                    self.world_ship_masks,
-                    self.ship_ids,
-                    hit_mask,
-                    self.board_size,
-                    confirmed_sunk=self.confirmed_sunk,
-                )
-                self.num_world_samples = len(self.world_masks)
-            else:
-                existing_union = filtered_union if filtered_union is not None else None
-                existing_masks = filtered_masks if filtered_masks is not None else None
-                (
-                    self.world_masks,
-                    self.world_ship_masks,
-                    self.cell_hit_counts,
-                    self.ship_sunk_probs,
-                    self.num_world_samples,
-                ) = sample_worlds(
-                    self.board,
-                    self.placements,
-                    self.ship_ids,
-                    self.confirmed_sunk,
-                    self.assigned_hits,
-                    board_size=self.board_size,
-                    cell_prior=cell_prior,
-                    target_worlds=target_worlds,
-                    existing_union=existing_union,
-                    existing_ship_masks=existing_masks,
-                    return_ship_masks=True,
-                    placement_index=self._placement_index,
-                )
-            self._world_cache_key = cache_key
-
-        N = self.num_world_samples
-        if N > 0:
-            self.cell_probs = [cnt / N for cnt in self.cell_hit_counts]
-        else:
-            self.cell_probs = [0.0] * (self.board_size * self.board_size)
-
-        # Detect whether the underlying world model used exact enumeration
-        # or Monte Carlo sampling, mirroring the logic in sample_worlds.
-        if N > 0:
-            # How many ships remain (not confirmed sunk)?
-            remaining_ships = [s for s in self.ship_ids if s not in self.confirmed_sunk]
-            self.remaining_ship_count = len(remaining_ships)
-
-            # Recompute allowed placements to estimate the search-space size.
-            allowed = filter_allowed_placements(
-                self.placements,
-                hit_mask,
-                miss_mask,
-                self.confirmed_sunk,
-                self.assigned_hits,
-                self.board_size,
-                placement_index=self._placement_index,
-            )
-
-            force_enumeration = (self.remaining_ship_count == 1)
-
-            product = 1
-            enumeration = True
-            if not force_enumeration:
-                for ship in self.ship_ids:
-                    n = len(allowed[ship])
-                    product *= n
-                    if product > ENUMERATION_PRODUCT_LIMIT:
-                        enumeration = False
-                        break
-            else:
-                # Endgame: only one ship left -> always enumerate in sample_worlds.
-                enumeration = True
-
-            if cell_prior is not None:
-                enumeration = False
-            self.enumeration_mode = enumeration
-        else:
-            # No consistent layouts found - mode doesn't really matter.
-            self.enumeration_mode = False
-            self.remaining_ship_count = len([s for s in self.ship_ids if s not in self.confirmed_sunk])
-
-        self.game_over = self._are_all_ships_sunk()
-
-        if not self.game_over and N > 0:
-            info_vals, two_ply_cells, two_ply_p = self._choose_best_cells_with_2ply()
-            self.info_gain_values = info_vals
-            self.two_ply_best_cells = two_ply_cells
-            self.two_ply_best_prob = two_ply_p
-        else:
-            self.best_cells = []
-            self.best_prob = 0.0
-            self.two_ply_best_cells = []
-            self.two_ply_best_prob = 0.0
-            self.info_gain_values = [0.0] * (self.board_size * self.board_size)
-
-        self.active_phase = classify_phase(
+        phase = classify_phase(
             self.board,
             self.confirmed_sunk,
             self.assigned_hits,
             self.ship_ids,
             board_size=self.board_size,
         )
-        model_key, reason, best_overall = self._resolve_active_model(self.active_phase)
+        model_key, reason, best_overall = self._resolve_active_model(phase)
+        self.active_phase = phase
         self.active_model_key = model_key
         self.active_model_reason = reason
+        self._pending_best_overall = best_overall
 
+        compute_two_ply = (model_key == "two_ply")
+
+        return {
+            "board": board_copy,
+            "board_size": self.board_size,
+            "placements": self.placements,
+            "ship_ids": list(self.ship_ids),
+            "confirmed_sunk": confirmed_sunk_copy,
+            "assigned_hits": assigned_hits_copy,
+            "cell_prior": cell_prior,
+            "placement_index": self._placement_index,
+            "target_worlds": WORLD_SAMPLE_TARGET,
+            "cache_key": self._world_cache_key,
+            "world_masks": list(self.world_masks),
+            "world_ship_masks": list(self.world_ship_masks),
+            "prior_key": prior_key,
+            "compute_two_ply": compute_two_ply,
+        }
+
+    def _start_recompute_job(self) -> None:
+        if self._recompute_running:
+            self._recompute_pending = True
+            return
+        self._recompute_pending = False
+        self._recompute_running = True
+        self._recompute_job_seq += 1
+        job_id = self._recompute_job_seq
+        payload = self._build_recompute_request()
+        self._last_recompute_request = payload
+        task = _AttackRecomputeTask(job_id, payload)
+        task.signals.finished.connect(self._on_recompute_finished)
+        task.signals.error.connect(self._on_recompute_error)
+        QtCore.QThreadPool.globalInstance().start(task)
+
+    def _on_recompute_error(self, job_id: int, message: str) -> None:
+        if job_id != self._recompute_job_seq:
+            return
+        self._recompute_running = False
+        debug_msg = str(message or "unknown error")
+        try:
+            self.active_model_label.setText(f"Recompute failed: {debug_msg}")
+        except Exception:
+            pass
+        if self._recompute_pending:
+            self._schedule_recompute(immediate=True)
+
+    def _on_recompute_finished(self, job_id: int, result: dict) -> None:
+        if job_id != self._recompute_job_seq:
+            return
+        self._recompute_running = False
+        self._apply_recompute_result(result)
+        if self._recompute_pending:
+            self._schedule_recompute(immediate=True)
+
+    def _apply_recompute_result(self, result: dict) -> None:
+        self._world_cache_key = result.get("cache_key")
+        self.world_masks = result.get("world_masks", [])
+        self.world_ship_masks = result.get("world_ship_masks", [])
+        self.cell_hit_counts = result.get("cell_hit_counts", [])
+        self.ship_sunk_probs = result.get("ship_sunk_probs", {})
+        self.num_world_samples = int(result.get("num_world_samples", 0))
+        self.cell_probs = result.get("cell_probs", [])
+        self.info_gain_values = result.get("info_gain_values", [])
+        self.enumeration_mode = bool(result.get("enumeration_mode", False))
+        self.remaining_ship_count = int(result.get("remaining_ship_count", len(self.ship_ids)))
+        self.two_ply_best_cells = list(result.get("two_ply_cells", []))
+        self.two_ply_best_prob = float(result.get("two_ply_prob", 0.0))
+
+        self.game_over = self._are_all_ships_sunk()
+
+        N = self.num_world_samples
         unknown_cells = [
             (r, c)
             for r in range(self.board_size)
@@ -2338,10 +2707,20 @@ class AttackTab(QtWidgets.QWidget):
         score_label = "Score"
         higher_better = True
         note = ""
+        model_key = self.active_model_key or "greedy"
         if not self.game_over and N > 0 and unknown_cells:
-            candidates, score_label, higher_better, note = self._rank_cells_for_model(
-                model_key, unknown_cells
-            )
+            if model_key == "two_ply":
+                for cell in self.two_ply_best_cells:
+                    r, c = cell
+                    p_hit = self.cell_probs[cell_index(r, c, self.board_size)] if self.cell_probs else 0.0
+                    candidates.append({"cell": cell, "p_hit": p_hit, "score": p_hit})
+                score_label = "2-ply"
+                higher_better = False
+                note = "Two-ply selection"
+            else:
+                candidates, score_label, higher_better, note = self._rank_cells_for_model(
+                    model_key, unknown_cells
+                )
 
         if model_key == "two_ply":
             self.best_cells = list(self.two_ply_best_cells)
@@ -2378,7 +2757,8 @@ class AttackTab(QtWidgets.QWidget):
                 if rollout_result is not None:
                     best_cell, avg_shots, timed_out = rollout_result
                     self.best_cells = [best_cell]
-                    self.best_prob = self.cell_probs[cell_index(best_cell[0], best_cell[1], self.board_size)]
+                    if self.cell_probs:
+                        self.best_prob = self.cell_probs[cell_index(best_cell[0], best_cell[1], self.board_size)]
                     rollout_note = f"Lookahead: expected remaining shots ~{avg_shots:.1f}"
                     if timed_out:
                         rollout_note += " (throttled)"
@@ -2386,23 +2766,18 @@ class AttackTab(QtWidgets.QWidget):
                     rollout_note = str(budget.get("note", "")).strip()
             if model_key == "rollout_mcts" and not self.rollout_enabled:
                 if budget.get("enabled", False):
-                    if rollout_note:
-                        rollout_note += " (model forces lookahead)"
-                    else:
-                        rollout_note = "Lookahead active (model forces lookahead)."
+                    rollout_note = (rollout_note + " (model forces lookahead)").strip()
                 else:
-                    if rollout_note:
-                        rollout_note += " (model throttled)"
-                    else:
-                        rollout_note = "Lookahead throttled (model selected)."
+                    rollout_note = (rollout_note + " (model throttled)").strip()
 
         warnings = self._compute_warnings()
         self.warning_label.setText(warnings)
 
         active_name = self._get_model_name(model_key)
-        best_overall_name = self._get_model_name(best_overall) if best_overall else "N/A"
+        best_overall_key = getattr(self, "_pending_best_overall", None)
+        best_overall_name = self._get_model_name(best_overall_key) if best_overall_key else "N/A"
         self.active_model_label.setText(
-            f"Active model: {active_name} | Phase: {self.active_phase} | {reason}. "
+            f"Active model: {active_name} | Phase: {self.active_phase} | {self.active_model_reason}. "
             f"Best overall: {best_overall_name}"
         )
 
@@ -2415,11 +2790,61 @@ class AttackTab(QtWidgets.QWidget):
         self.update_status_view()
 
         if self.linked_defense_tab:
-            self.update_win_prediction(self.linked_defense_tab)
+            self._schedule_win_prediction()
         try:
             self.state_updated.emit()
         except Exception:
             pass
+
+    def _schedule_win_prediction(self) -> None:
+        self._win_pred_timer.start()
+
+    def _start_win_prediction_job(self) -> None:
+        if self._win_pred_running or not self.linked_defense_tab:
+            return
+        if not self.world_masks:
+            return
+        self._win_pred_running = True
+        self._win_pred_job_seq += 1
+        job_id = self._win_pred_job_seq
+        defense = self.linked_defense_tab
+        payload = {
+            "board": [row[:] for row in self.board],
+            "board_size": self.board_size,
+            "world_masks": list(self.world_masks),
+            "cell_probs": list(self.cell_probs),
+            "defense_layout_board": [row[:] for row in getattr(defense, "layout_board", [])],
+            "defense_shot_board": [row[:] for row in getattr(defense, "shot_board", [])],
+            "defense_hit_counts_phase": getattr(defense, "hit_counts_phase", None),
+            "defense_miss_counts_phase": getattr(defense, "miss_counts_phase", None),
+            "defense_disp_counts": getattr(defense, "disp_counts", None),
+        }
+        self._last_win_pred_request = payload
+        task = _WinPredictionTask(job_id, payload)
+        task.signals.finished.connect(self._on_win_pred_finished)
+        task.signals.error.connect(self._on_win_pred_error)
+        QtCore.QThreadPool.globalInstance().start(task)
+
+    def _on_win_pred_error(self, job_id: int, message: str) -> None:
+        if job_id != self._win_pred_job_seq:
+            return
+        self._win_pred_running = False
+        if hasattr(self, "win_prob_label"):
+            self.win_prob_label.setText("Win Prob: N/A")
+
+    def _on_win_pred_finished(self, job_id: int, result: object) -> None:
+        if job_id != self._win_pred_job_seq:
+            return
+        self._win_pred_running = False
+        if not hasattr(self, "win_prob_label"):
+            return
+        if result is None:
+            self.win_prob_label.setText("Win Prob: N/A (Need Defense Layout)")
+            return
+        prob, my_total, opp_avg = result
+        self.win_prob_label.setText(
+            f"Win Prob: {prob:.1f}% (You {my_total:.1f} vs Opp {opp_avg:.1f})"
+        )
 
     def _choose_best_cells_with_2ply(self) -> Tuple[List[float], List[Tuple[int, int]], float]:
         if not self.world_masks:
@@ -2433,6 +2858,81 @@ class AttackTab(QtWidgets.QWidget):
         )
         best_cells = [(idx // self.board_size, idx % self.board_size) for idx in best_indices]
         return info_vals, best_cells, best_p
+
+    def _cell_style_for_view(
+        self,
+        r: int,
+        c: int,
+        show_hit_prob: bool,
+        show_info_gain: bool,
+        best_set: Set[Tuple[int, int]],
+        assigned_cells: Set[Tuple[int, int]],
+    ) -> Tuple[str, str]:
+        state = self.board[r][c]
+        idx = cell_index(r, c, self.board_size)
+
+        base_color = Theme.BG_DARK
+        text_color = Theme.TEXT_MAIN
+        border_style = f"1px solid {Theme.BORDER_EMPTY}"
+        text = ""
+
+        if state == EMPTY:
+            heat_val = 0.0
+            if show_hit_prob and idx < len(self.cell_probs):
+                heat_val = self.cell_probs[idx]
+                if heat_val > 0:
+                    text = f"{int(round(heat_val * 100))}"
+            elif show_info_gain and idx < len(self.info_gain_values):
+                heat_val = self.info_gain_values[idx]
+                if heat_val > 0:
+                    text = f"{int(round(heat_val * 100))}"
+            if heat_val > 0.0:
+                base_color = self._get_interpolated_color(heat_val)
+                if heat_val > 0.6:
+                    text_color = Theme.TEXT_DARK
+        elif state == MISS:
+            base_color = Theme.MISS_BG
+            text_color = Theme.MISS_TEXT
+            border_style = f"1px solid {Theme.MISS_BORDER}"
+            text = "M"
+        elif state == HIT:
+            base_color = Theme.HIT_BG
+            text_color = Theme.HIT_TEXT
+            border_style = f"1px solid {Theme.HIT_BORDER}"
+            text = "H"
+            if (r, c) in assigned_cells:
+                border_style = f"2px dashed {Theme.ASSIGNED_BORDER}"
+
+        style_str = (
+            f"background-color: {base_color};"
+            f"color: {text_color};"
+            f"border: {border_style};"
+        )
+
+        if not self.game_over and (r, c) in best_set and state == EMPTY:
+            style_str += f"border: 2px solid {Theme.BORDER_BEST};"
+
+        return style_str, text
+
+    def _update_cells_view(self, cells: Sequence[Tuple[int, int]]) -> None:
+        if not cells:
+            return
+        overlay_mode = self.overlay_combo.currentIndex()
+        show_hit_prob = (overlay_mode == 1 and not self.game_over)
+        show_info_gain = (overlay_mode == 2 and not self.game_over)
+        best_set = {(r, c) for (r, c) in self.best_cells}
+        assigned_cells: Set[Tuple[int, int]] = set()
+        for sset in self.assigned_hits.values():
+            assigned_cells.update(sset)
+        for r, c in cells:
+            if not (0 <= r < self.board_size and 0 <= c < self.board_size):
+                continue
+            btn = self.cell_buttons[r][c]
+            style_str, text = self._cell_style_for_view(
+                r, c, show_hit_prob, show_info_gain, best_set, assigned_cells
+            )
+            btn.setStyleSheet(style_str)
+            btn.setText(text)
 
     def _get_interpolated_color(self, val: float) -> str:
         """
@@ -2465,65 +2965,16 @@ class AttackTab(QtWidgets.QWidget):
         show_info_gain = (overlay_mode == 2 and not self.game_over)
 
         best_set = {(r, c) for (r, c) in self.best_cells}
+        assigned_cells: Set[Tuple[int, int]] = set()
+        for sset in self.assigned_hits.values():
+            assigned_cells.update(sset)
 
         for r in range(self.board_size):
             for c in range(self.board_size):
                 btn = self.cell_buttons[r][c]
-                state = self.board[r][c]
-                idx = cell_index(r, c, self.board_size)
-
-                # Default empty style
-                base_color = Theme.BG_DARK
-                text_color = Theme.TEXT_MAIN
-                border_style = f"1px solid {Theme.BORDER_EMPTY}"
-                text = ""
-
-                if state == EMPTY:
-                    # --- HEATMAP LOGIC START ---
-                    heat_val = 0.0
-                    if show_hit_prob:
-                        heat_val = self.cell_probs[idx]
-                        if heat_val > 0:
-                            text = f"{int(round(heat_val * 100))}"
-                    elif show_info_gain:
-                        heat_val = self.info_gain_values[idx]
-                        if heat_val > 0:
-                            text = f"{int(round(heat_val * 100))}"
-
-                    # Apply gradient if we have a value to show
-                    if heat_val > 0.0:
-                        base_color = self._get_interpolated_color(heat_val)
-                        # If the background gets too bright, switch text to black for contrast
-                        if heat_val > 0.6:
-                            text_color = Theme.TEXT_DARK
-                    # --- HEATMAP LOGIC END ---
-
-                elif state == MISS:
-                    base_color = Theme.MISS_BG
-                    text_color = Theme.MISS_TEXT
-                    border_style = f"1px solid {Theme.MISS_BORDER}"
-                    text = "M"
-                elif state == HIT:
-                    base_color = Theme.HIT_BG
-                    text_color = Theme.HIT_TEXT
-                    border_style = f"1px solid {Theme.HIT_BORDER}"
-                    text = "H"
-                    assigned = any((r, c) in self.assigned_hits[s] for s in self.ship_ids)
-                    if assigned:
-                        border_style = f"2px dashed {Theme.ASSIGNED_BORDER}"
-
-                # Construct the final stylesheet
-                style_str = (
-                    f"background-color: {base_color};"
-                    f"color: {text_color};"
-                    f"border: {border_style};"
+                style_str, text = self._cell_style_for_view(
+                    r, c, show_hit_prob, show_info_gain, best_set, assigned_cells
                 )
-
-                # Highlight the "Best Guess" recommended by the solver
-                if not self.game_over and (r, c) in best_set and state == EMPTY:
-                    # Add a bright cyan border to the best moves
-                    style_str += f"border: 2px solid {Theme.BORDER_BEST};"
-
                 btn.setStyleSheet(style_str)
                 btn.setText(text)
 
