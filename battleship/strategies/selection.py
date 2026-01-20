@@ -607,6 +607,7 @@ def _choose_next_shot_for_strategy(
             alpha * cell_probs[i] + (1.0 - alpha) * float(opponent_prior[i])
             for i in range(total_cells)
         ]
+        cell_probs = combined_probs
 
     def _entropy_score_idx(idx: int) -> float:
         n_hit = cell_hit_counts[idx]

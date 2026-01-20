@@ -2286,11 +2286,9 @@ class AttackTab(QtWidgets.QWidget):
             score_label = "Info (1-ply)"
 
             def score_entropy(r: int, c: int) -> float:
-                idx = cell_index(r, c, self.board_size)
-                n_hit = self.cell_hit_counts[idx]
-                if n_hit <= 0 or n_hit >= N:
+                p_h = p_hit(r, c)
+                if p_h <= 0.0 or p_h >= 1.0:
                     return 0.0
-                p_h = n_hit / N
                 p_m = 1.0 - p_h
                 return -(p_h * math.log2(p_h) + p_m * math.log2(p_m))
 
@@ -3291,6 +3289,12 @@ class AttackTab(QtWidgets.QWidget):
             for c in range(self.board_size)
             if self.board[r][c] == EMPTY
         ]
+        is_target_mode = self._is_target_mode(unknown_cells)
+        use_combined = (
+            (not is_target_mode)
+            and isinstance(self.combined_probs, list)
+            and len(self.combined_probs) == self.board_size * self.board_size
+        )
 
         candidates: List[Dict[str, object]] = []
         score_label = "Score"
@@ -3299,9 +3303,21 @@ class AttackTab(QtWidgets.QWidget):
         model_key = self.active_model_key or "greedy"
         if not self.game_over and N > 0 and unknown_cells:
             if model_key == "two_ply":
+                if use_combined and self.two_ply_best_cells:
+                    best_cell = max(
+                        self.two_ply_best_cells,
+                        key=lambda cell: self.combined_probs[
+                            cell_index(cell[0], cell[1], self.board_size)
+                        ],
+                    )
+                    self.two_ply_best_cells = [best_cell]
                 for cell in self.two_ply_best_cells:
                     r, c = cell
-                    p_hit = self.cell_probs[cell_index(r, c, self.board_size)] if self.cell_probs else 0.0
+                    idx = cell_index(r, c, self.board_size)
+                    if use_combined:
+                        p_hit = self.combined_probs[idx]
+                    else:
+                        p_hit = self.cell_probs[idx] if self.cell_probs else 0.0
                     candidates.append({"cell": cell, "p_hit": p_hit, "score": p_hit})
                 score_label = "2-ply"
                 higher_better = False
