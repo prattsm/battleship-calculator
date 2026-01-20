@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import time
 import uuid
@@ -40,6 +41,111 @@ from battleship.sim.defense_sim import build_base_heat, simulate_enemy_game_phas
 from battleship.strategies.selection import Posterior, _choose_next_shot_for_strategy, two_ply_selection
 from battleship.strategies.registry import model_defs
 from battleship.ui.theme import Theme
+
+OPPONENT_PROFILE_VERSION = 2
+OPPONENT_LAYOUT_MASK_CAP = int(os.environ.get("OPPONENT_LAYOUT_MASK_CAP", "400"))
+OPPONENT_RECENCY_HALFLIFE = float(os.environ.get("OPPONENT_RECENCY_HALFLIFE", "25"))
+OPPONENT_PAIR_TOP_K = int(os.environ.get("OPPONENT_PAIR_TOP_K", "25"))
+OPPONENT_NEARBY_RADIUS = int(os.environ.get("OPPONENT_NEARBY_RADIUS", "2"))
+
+
+def _iter_mask_indices(mask: int) -> List[int]:
+    idxs: List[int] = []
+    m = int(mask)
+    while m:
+        lsb = m & -m
+        idx = lsb.bit_length() - 1
+        idxs.append(idx)
+        m ^= lsb
+    return idxs
+
+
+def _mask_to_cells(mask: int, board_size: int) -> List[Tuple[int, int]]:
+    cells: List[Tuple[int, int]] = []
+    for idx in _iter_mask_indices(mask):
+        cells.append((idx // board_size, idx % board_size))
+    return cells
+
+
+def _count_adjacent_pairs(mask: int, board_size: int) -> int:
+    count = 0
+    m = int(mask)
+    while m:
+        lsb = m & -m
+        idx = lsb.bit_length() - 1
+        m ^= lsb
+        r = idx // board_size
+        c = idx % board_size
+        if c + 1 < board_size:
+            right = idx + 1
+            if (mask >> right) & 1:
+                count += 1
+        if r + 1 < board_size:
+            down = idx + board_size
+            if (mask >> down) & 1:
+                count += 1
+    return count
+
+
+def _connected_components_sizes(mask: int, board_size: int) -> List[int]:
+    sizes: List[int] = []
+    remaining = int(mask)
+    while remaining:
+        lsb = remaining & -remaining
+        start = lsb.bit_length() - 1
+        remaining ^= lsb
+        stack = [start]
+        size = 0
+        while stack:
+            idx = stack.pop()
+            size += 1
+            r = idx // board_size
+            c = idx % board_size
+            neighbors: List[int] = []
+            if r > 0:
+                neighbors.append(idx - board_size)
+            if r + 1 < board_size:
+                neighbors.append(idx + board_size)
+            if c > 0:
+                neighbors.append(idx - 1)
+            if c + 1 < board_size:
+                neighbors.append(idx + 1)
+            for nidx in neighbors:
+                bit = 1 << nidx
+                if remaining & bit:
+                    remaining ^= bit
+                    stack.append(nidx)
+        sizes.append(size)
+    return sizes
+
+
+def _edge_distance(r: int, c: int, board_size: int) -> int:
+    return min(r, c, board_size - 1 - r, board_size - 1 - c)
+
+
+def _neighbor_offsets(radius: int) -> List[Tuple[int, int]]:
+    offsets: List[Tuple[int, int]] = []
+    r = max(1, int(radius))
+    for dr in range(-r, r + 1):
+        for dc in range(-r, r + 1):
+            if dr == 0 and dc == 0:
+                continue
+            if max(abs(dr), abs(dc)) <= r:
+                offsets.append((dr, dc))
+    return offsets
+
+
+_NEARBY_OFFSETS = _neighbor_offsets(OPPONENT_NEARBY_RADIUS)
+
+
+def _heat_color(val: float) -> str:
+    val = max(0.0, min(1.0, float(val)))
+    start_r, start_g, start_b = 2, 6, 23
+    end_r, end_g, end_b = 14, 165, 233
+    r = int(start_r + (end_r - start_r) * val)
+    g = int(start_g + (end_g - start_g) * val)
+    b = int(start_b + (end_b - start_b) * val)
+    return f"rgb({r},{g},{b})"
 
 
 class _AttackRecomputeSignals(QtCore.QObject):
@@ -90,6 +196,8 @@ def _compute_attack_recompute(payload: dict) -> dict:
     confirmed_sunk = payload["confirmed_sunk"]
     assigned_hits = payload["assigned_hits"]
     cell_prior = payload.get("cell_prior")
+    opponent_prior = payload.get("opponent_prior")
+    use_opponent_prior = bool(payload.get("use_opponent_prior", False))
     placement_index = payload.get("placement_index")
     target_worlds = payload.get("target_worlds", WORLD_SAMPLE_TARGET)
     prev_cache_key = payload.get("cache_key")
@@ -216,6 +324,22 @@ def _compute_attack_recompute(payload: dict) -> dict:
         cell_probs = [0.0] * (board_size * board_size)
         info_vals = [0.0] * (board_size * board_size)
 
+    combined_probs = list(cell_probs)
+    prior_alpha = 1.0
+    if (
+        use_opponent_prior
+        and isinstance(opponent_prior, list)
+        and len(opponent_prior) == board_size * board_size
+        and N > 0
+    ):
+        target = max(1, int(target_worlds))
+        quality = min(1.0, float(N) / float(target))
+        prior_alpha = max(0.2, min(0.95, quality))
+        combined_probs = [
+            prior_alpha * cell_probs[i] + (1.0 - prior_alpha) * float(opponent_prior[i])
+            for i in range(board_size * board_size)
+        ]
+
     # Determine enumeration mode (matches sample_worlds logic)
     if N > 0:
         remaining_ships = [s for s in ship_ids if s not in confirmed_sunk]
@@ -267,6 +391,8 @@ def _compute_attack_recompute(payload: dict) -> dict:
         "ship_sunk_probs": ship_sunk_probs,
         "num_world_samples": N,
         "cell_probs": cell_probs,
+        "combined_probs": combined_probs,
+        "prior_alpha": prior_alpha,
         "info_gain_values": info_vals,
         "enumeration_mode": enumeration,
         "remaining_ship_count": remaining_ship_count,
@@ -464,6 +590,7 @@ class AttackTab(QtWidgets.QWidget):
         self.world_masks: List[int] = []
         self.cell_hit_counts: List[int] = [0] * (self.board_size * self.board_size)
         self.cell_probs: List[float] = [0.0] * (self.board_size * self.board_size)
+        self.combined_probs: List[float] = [0.0] * (self.board_size * self.board_size)
         self.info_gain_values: List[float] = [0.0] * (self.board_size * self.board_size)
         self.num_world_samples: int = 0
         self.ship_sunk_probs: Dict[str, float] = {s: 0.0 for s in self.ship_ids}
@@ -513,6 +640,11 @@ class AttackTab(QtWidgets.QWidget):
         self._using_opponent_prior: bool = False
         self._opponent_prior_confidence: float = 0.0
         self._opponent_prior_total: float = 0.0
+        self._opponent_prior_entropy: float = 0.0
+        self._opponent_profile_mismatch: bool = False
+        self._opponent_profile_mismatch_reason: str = ""
+        self._opponent_prior: Optional[List[float]] = None
+        self._opponent_prior_alpha: float = 1.0
         self._world_cache_key = None
         self.world_ship_masks: List[Tuple[int, ...]] = []
         self._placement_index = build_placement_index(self.placements, self.board_size)
@@ -978,22 +1110,163 @@ class AttackTab(QtWidgets.QWidget):
         self.lock_model_cb.blockSignals(False)
 
     def _new_opponent_profile(self, name: str) -> Dict[str, object]:
+        expected_cells = self._expected_ship_cells()
+        signature = self._ship_signature()
+        edge_bins = max(1, (self.board_size + 1) // 2)
         return {
             "name": name,
+            "version": OPPONENT_PROFILE_VERSION,
+            "board_size": int(self.board_size),
+            "expected_cells": int(expected_cells),
+            "ship_signature": signature,
+            "timestamp_last": None,
             "cell_counts": [0.0] * (self.board_size * self.board_size),
             "layouts_recorded": 0,
+            "layout_masks": [],
+            "adjacency_hist": {},
+            "adjacent_pairs_total": 0,
+            "cluster_size_hist": {},
+            "row_counts": [0.0] * self.board_size,
+            "col_counts": [0.0] * self.board_size,
+            "edge_dist_hist": [0] * edge_bins,
+            "nearby_counts": [0.0] * (self.board_size * self.board_size),
+            "pair_counts_top": {},
+            "clusters_sum": 0.0,
+            "largest_cluster_sum": 0.0,
+            "adjacent_pairs_sum": 0.0,
+            "clump_score_sum": 0.0,
+            "clump_score_sumsq": 0.0,
         }
 
+    def _ship_signature(self) -> str:
+        parts: List[str] = []
+        for spec in self.layout.ships:
+            if spec.kind == "line":
+                parts.append(f"line{int(spec.length or 0)}")
+            else:
+                parts.append(f"shape{len(spec.cells or [])}")
+        parts.sort()
+        return ",".join(parts)
+
+    def _normalize_opponent_profile(self, profile: Dict[str, object]) -> Dict[str, object]:
+        total_cells = self.board_size * self.board_size
+        edge_bins = max(1, (self.board_size + 1) // 2)
+
+        counts = profile.get("cell_counts")
+        if not isinstance(counts, list) or len(counts) != total_cells:
+            profile["cell_counts"] = [0.0] * total_cells
+
+        layouts = profile.get("layouts_recorded")
+        if not isinstance(layouts, int) or layouts < 0:
+            profile["layouts_recorded"] = 0
+
+        layout_masks = profile.get("layout_masks")
+        if not isinstance(layout_masks, list):
+            profile["layout_masks"] = []
+        else:
+            cleaned = [int(m) for m in layout_masks if isinstance(m, int)]
+            if len(cleaned) > OPPONENT_LAYOUT_MASK_CAP:
+                cleaned = cleaned[-OPPONENT_LAYOUT_MASK_CAP :]
+            profile["layout_masks"] = cleaned
+
+        for key in ("adjacency_hist", "cluster_size_hist", "pair_counts_top"):
+            val = profile.get(key)
+            if not isinstance(val, dict):
+                profile[key] = {}
+
+        row_counts = profile.get("row_counts")
+        if not isinstance(row_counts, list) or len(row_counts) != self.board_size:
+            profile["row_counts"] = [0.0] * self.board_size
+        col_counts = profile.get("col_counts")
+        if not isinstance(col_counts, list) or len(col_counts) != self.board_size:
+            profile["col_counts"] = [0.0] * self.board_size
+
+        edge_hist = profile.get("edge_dist_hist")
+        if not isinstance(edge_hist, list) or len(edge_hist) != edge_bins:
+            profile["edge_dist_hist"] = [0] * edge_bins
+
+        nearby_counts = profile.get("nearby_counts")
+        if not isinstance(nearby_counts, list) or len(nearby_counts) != total_cells:
+            profile["nearby_counts"] = [0.0] * total_cells
+
+        for key in (
+            "adjacent_pairs_total",
+            "clusters_sum",
+            "largest_cluster_sum",
+            "adjacent_pairs_sum",
+            "clump_score_sum",
+            "clump_score_sumsq",
+        ):
+            val = profile.get(key)
+            if not isinstance(val, (int, float)):
+                profile[key] = 0.0
+
+        if "version" not in profile:
+            profile["version"] = OPPONENT_PROFILE_VERSION
+        if "board_size" not in profile:
+            profile["board_size"] = int(self.board_size)
+        if "expected_cells" not in profile:
+            profile["expected_cells"] = int(self._expected_ship_cells())
+        if "ship_signature" not in profile:
+            profile["ship_signature"] = self._ship_signature()
+        if "timestamp_last" not in profile:
+            profile["timestamp_last"] = None
+
+        return profile
+
+    def _profile_metadata_mismatch_reason(self, profile: Dict[str, object]) -> str:
+        reasons: List[str] = []
+        p_board = profile.get("board_size")
+        p_expected = profile.get("expected_cells")
+        p_sig = profile.get("ship_signature")
+        if isinstance(p_board, int) and p_board != self.board_size:
+            reasons.append(f"board size {p_board} vs {self.board_size}")
+        expected_now = int(self._expected_ship_cells())
+        if isinstance(p_expected, int) and p_expected != expected_now:
+            reasons.append(f"ship cells {p_expected} vs {expected_now}")
+        sig_now = self._ship_signature()
+        if isinstance(p_sig, str) and p_sig != sig_now:
+            reasons.append("ship set changed")
+        return ", ".join(reasons)
+
     def _export_opponent_profile(self) -> Dict[str, object]:
-        return {
+        profile: Dict[str, object] = {
             "name": self._current_opponent_name(),
+            "version": OPPONENT_PROFILE_VERSION,
+            "board_size": int(self.board_size),
+            "expected_cells": int(self._expected_ship_cells()),
+            "ship_signature": self._ship_signature(),
+            "timestamp_last": time.time(),
             "cell_counts": list(self.opponent_cell_counts),
             "layouts_recorded": int(self.opponent_layouts_recorded),
         }
+        if self.active_opponent_id and self.active_opponent_id in self.opponents:
+            stored = self.opponents[self.active_opponent_id]
+            if isinstance(stored, dict):
+                for key in (
+                    "layout_masks",
+                    "adjacency_hist",
+                    "adjacent_pairs_total",
+                    "cluster_size_hist",
+                    "row_counts",
+                    "col_counts",
+                    "edge_dist_hist",
+                    "nearby_counts",
+                    "pair_counts_top",
+                    "clusters_sum",
+                    "largest_cluster_sum",
+                    "adjacent_pairs_sum",
+                    "clump_score_sum",
+                    "clump_score_sumsq",
+                ):
+                    if key in stored:
+                        profile[key] = stored.get(key)
+        return self._normalize_opponent_profile(profile)
 
     def _import_opponent_profile(self, profile: Dict[str, object]) -> None:
         self._loading_opponent = True
         try:
+            profile = self._normalize_opponent_profile(profile)
             counts = profile.get("cell_counts")
             if (
                 isinstance(counts, list)
@@ -1009,6 +1282,13 @@ class AttackTab(QtWidgets.QWidget):
                 self.opponent_layouts_recorded = layouts
             else:
                 self.opponent_layouts_recorded = 0
+            mismatch_reason = self._profile_metadata_mismatch_reason(profile)
+            if mismatch_reason:
+                self._opponent_profile_mismatch = True
+                self._opponent_profile_mismatch_reason = mismatch_reason
+            else:
+                self._opponent_profile_mismatch = False
+                self._opponent_profile_mismatch_reason = ""
         finally:
             self._loading_opponent = False
         self._update_opponent_stats_label()
@@ -1054,6 +1334,9 @@ class AttackTab(QtWidgets.QWidget):
             self.active_opponent_id = oid
         if self.active_opponent_id not in self.opponents:
             self.active_opponent_id = next(iter(self.opponents))
+        for oid, profile in list(self.opponents.items()):
+            if isinstance(profile, dict):
+                self.opponents[oid] = self._normalize_opponent_profile(profile)
         self._refresh_opponent_combo(self.active_opponent_id)
 
     def _find_opponent_id_by_name(self, name: str) -> Optional[str]:
@@ -1212,15 +1495,125 @@ class AttackTab(QtWidgets.QWidget):
     def _update_opponent_stats_label(self) -> None:
         if not hasattr(self, "opponent_stats_label"):
             return
+        profile = self.opponents.get(self.active_opponent_id or "", {})
+        if not isinstance(profile, dict):
+            profile = {}
+        profile = self._normalize_opponent_profile(profile)
+
         total = sum(self.opponent_cell_counts)
         total_i = int(round(total))
-        self.opponent_stats_label.setText(
-            f"Layouts recorded: {self.opponent_layouts_recorded}. "
-            f"Ship cells observed: {total_i}."
-        )
+        layouts = int(self.opponent_layouts_recorded)
+        expected_cells = max(1, int(self._expected_ship_cells()))
+        lines: List[str] = []
+        lines.append(f"Layouts recorded: {layouts}. Ship cells observed: {total_i}.")
+
+        # Edge bias
+        edge_hist = profile.get("edge_dist_hist", [])
+        if isinstance(edge_hist, list) and edge_hist:
+            edge_total = sum(edge_hist)
+            if edge_total > 0:
+                avg_edge = sum(i * edge_hist[i] for i in range(len(edge_hist))) / edge_total
+                lines.append(f"Edge bias: avg dist {avg_edge:.2f} (0=edge).")
+
+        # Corner bias
+        corner_rate = 0.0
+        if layouts > 0 and len(self.opponent_cell_counts) == self.board_size * self.board_size:
+            corners = [
+                cell_index(0, 0, self.board_size),
+                cell_index(0, self.board_size - 1, self.board_size),
+                cell_index(self.board_size - 1, 0, self.board_size),
+                cell_index(self.board_size - 1, self.board_size - 1, self.board_size),
+            ]
+            corner_total = sum(self.opponent_cell_counts[i] for i in corners)
+            corner_rate = (corner_total / layouts) if layouts > 0 else 0.0
+            lines.append(f"Corner occupancy: {corner_rate:.2f} per game.")
+
+        # Row/column bias
+        row_counts = profile.get("row_counts", [])
+        col_counts = profile.get("col_counts", [])
+        if isinstance(row_counts, list) and row_counts and total > 0:
+            best_row = max(range(len(row_counts)), key=lambda i: row_counts[i])
+            row_share = row_counts[best_row] / total
+            lines.append(f"Row bias: row {best_row + 1} ({row_share * 100:.1f}%).")
+        if isinstance(col_counts, list) and col_counts and total > 0:
+            best_col = max(range(len(col_counts)), key=lambda i: col_counts[i])
+            col_share = col_counts[best_col] / total
+            lines.append(f"Col bias: col {chr(ord('A') + best_col)} ({col_share * 100:.1f}%).")
+
+        # Clump score stats
+        if layouts > 0:
+            clump_sum = float(profile.get("clump_score_sum", 0.0))
+            clump_sumsq = float(profile.get("clump_score_sumsq", 0.0))
+            mean = clump_sum / layouts
+            var = max(0.0, (clump_sumsq / layouts) - mean ** 2)
+            std = math.sqrt(var)
+            lines.append(f"Clump score: {mean:.2f} ± {std:.2f}.")
+
+        # Stability: recent vs all-time
+        layout_masks = profile.get("layout_masks", [])
+        if isinstance(layout_masks, list) and layout_masks and total > 0:
+            recent_n = min(20, len(layout_masks))
+            recent_counts = [0.0] * (self.board_size * self.board_size)
+            for mask in layout_masks[-recent_n:]:
+                if not isinstance(mask, int):
+                    continue
+                for idx in _iter_mask_indices(mask):
+                    if 0 <= idx < len(recent_counts):
+                        recent_counts[idx] += 1.0
+            recent_total = sum(recent_counts)
+            if recent_total > 0:
+                overall = [c / total for c in self.opponent_cell_counts]
+                recent = [c / recent_total for c in recent_counts]
+                delta = 0.5 * sum(abs(overall[i] - recent[i]) for i in range(len(overall)))
+                lines.append(f"Stability (last {recent_n} vs all): Δ={delta:.2f}.")
+
+        if self._opponent_profile_mismatch and self._opponent_profile_mismatch_reason:
+            lines.append(f"Warning: profile mismatch ({self._opponent_profile_mismatch_reason}).")
+
+        self.opponent_stats_label.setText(" ".join(lines))
 
     def _record_opponent_layout(self) -> None:
-        dialog = OpponentLayoutDialog(self.board_size, self._expected_ship_cells(), parent=self)
+        profile = self.opponents.get(self.active_opponent_id, {})
+        if isinstance(profile, dict):
+            profile = self._normalize_opponent_profile(profile)
+        else:
+            profile = self._new_opponent_profile(self._current_opponent_name())
+        mismatch_reason = self._profile_metadata_mismatch_reason(profile)
+        if mismatch_reason:
+            self._opponent_profile_mismatch = True
+            self._opponent_profile_mismatch_reason = mismatch_reason
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Opponent data mismatch",
+                f"This opponent profile was recorded with different settings ({mismatch_reason}).\n"
+                "Continue recording anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        else:
+            self._opponent_profile_mismatch = False
+            self._opponent_profile_mismatch_reason = ""
+
+        counts = profile.get("cell_counts", [])
+        heatmap: Optional[List[float]] = None
+        if isinstance(counts, list) and counts:
+            max_count = max(counts) if counts else 0.0
+            if max_count > 0:
+                heatmap = [float(v) / max_count for v in counts]
+
+        layout_masks = profile.get("layout_masks")
+        last_layout_mask = None
+        if isinstance(layout_masks, list) and layout_masks:
+            last_layout_mask = int(layout_masks[-1])
+
+        dialog = OpponentLayoutDialog(
+            self.board_size,
+            self._expected_ship_cells(),
+            heatmap=heatmap,
+            last_layout_mask=last_layout_mask,
+            parent=self,
+        )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
         cells = dialog.selected_cells()
@@ -1237,49 +1630,223 @@ class AttackTab(QtWidgets.QWidget):
             )
             if reply != QtWidgets.QMessageBox.Yes:
                 return
-        for r, c in cells:
-            idx = cell_index(r, c, self.board_size)
-            if 0 <= idx < len(self.opponent_cell_counts):
-                self.opponent_cell_counts[idx] += 1.0
-        self.opponent_layouts_recorded += 1
+
+        layout_mask = make_mask(cells, self.board_size)
+        idxs = _iter_mask_indices(layout_mask)
+
+        # Update profile metrics
+        profile = self._normalize_opponent_profile(profile)
+        profile["layouts_recorded"] = int(profile.get("layouts_recorded", 0)) + 1
+        profile["timestamp_last"] = time.time()
+
+        counts = profile.get("cell_counts", [0.0] * (self.board_size * self.board_size))
+        row_counts = profile.get("row_counts", [0.0] * self.board_size)
+        col_counts = profile.get("col_counts", [0.0] * self.board_size)
+        edge_hist = profile.get("edge_dist_hist", [0] * max(1, (self.board_size + 1) // 2))
+        nearby_counts = profile.get("nearby_counts", [0.0] * (self.board_size * self.board_size))
+
+        for idx in idxs:
+            if 0 <= idx < len(counts):
+                counts[idx] += 1.0
+            r = idx // self.board_size
+            c = idx % self.board_size
+            if 0 <= r < len(row_counts):
+                row_counts[r] += 1.0
+            if 0 <= c < len(col_counts):
+                col_counts[c] += 1.0
+            dist = _edge_distance(r, c, self.board_size)
+            if 0 <= dist < len(edge_hist):
+                edge_hist[dist] += 1
+            for dr, dc in _NEARBY_OFFSETS:
+                nr = r + dr
+                nc = c + dc
+                if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                    nidx = cell_index(nr, nc, self.board_size)
+                    if 0 <= nidx < len(nearby_counts):
+                        nearby_counts[nidx] += 1.0
+
+        adjacent_pairs = _count_adjacent_pairs(layout_mask, self.board_size)
+        profile["adjacent_pairs_total"] = float(profile.get("adjacent_pairs_total", 0.0)) + adjacent_pairs
+
+        adjacency_hist = profile.get("adjacency_hist", {})
+        key = str(int(adjacent_pairs))
+        adjacency_hist[key] = int(adjacency_hist.get(key, 0)) + 1
+
+        sizes = _connected_components_sizes(layout_mask, self.board_size)
+        clusters = len(sizes)
+        largest_cluster = max(sizes) if sizes else 0
+        mean_cluster = (sum(sizes) / clusters) if clusters else 0.0
+
+        profile["clusters_sum"] = float(profile.get("clusters_sum", 0.0)) + clusters
+        profile["largest_cluster_sum"] = float(profile.get("largest_cluster_sum", 0.0)) + largest_cluster
+        profile["adjacent_pairs_sum"] = float(profile.get("adjacent_pairs_sum", 0.0)) + adjacent_pairs
+
+        expected_cells = max(1, int(self._expected_ship_cells()))
+        clump_score = adjacent_pairs / float(expected_cells)
+        profile["clump_score_sum"] = float(profile.get("clump_score_sum", 0.0)) + clump_score
+        profile["clump_score_sumsq"] = float(profile.get("clump_score_sumsq", 0.0)) + (clump_score ** 2)
+
+        cluster_hist = profile.get("cluster_size_hist", {})
+        for size in sizes:
+            skey = str(int(size))
+            cluster_hist[skey] = int(cluster_hist.get(skey, 0)) + 1
+
+        pair_counts = profile.get("pair_counts_top", {})
+        if isinstance(pair_counts, dict) and counts:
+            top_k = max(1, OPPONENT_PAIR_TOP_K)
+            ranked = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)[:top_k]
+            layout_set = set(idxs)
+            active = [i for i in ranked if i in layout_set]
+            for i in range(len(active)):
+                for j in range(i + 1, len(active)):
+                    a = active[i]
+                    b = active[j]
+                    if a > b:
+                        a, b = b, a
+                    pkey = f"{a},{b}"
+                    pair_counts[pkey] = float(pair_counts.get(pkey, 0.0)) + 1.0
+
+        layout_masks = profile.get("layout_masks", [])
+        if not isinstance(layout_masks, list):
+            layout_masks = []
+        layout_masks.append(int(layout_mask))
+        if len(layout_masks) > OPPONENT_LAYOUT_MASK_CAP:
+            layout_masks = layout_masks[-OPPONENT_LAYOUT_MASK_CAP :]
+
+        profile["cell_counts"] = counts
+        profile["row_counts"] = row_counts
+        profile["col_counts"] = col_counts
+        profile["edge_dist_hist"] = edge_hist
+        profile["nearby_counts"] = nearby_counts
+        profile["adjacency_hist"] = adjacency_hist
+        profile["cluster_size_hist"] = cluster_hist
+        profile["pair_counts_top"] = pair_counts
+        profile["layout_masks"] = layout_masks
+
+        self.opponents[self.active_opponent_id] = profile
+        self.opponent_cell_counts = list(counts)
+        self.opponent_layouts_recorded = int(profile.get("layouts_recorded", 0))
         self._update_opponent_stats_label()
         self._save_current_profile()
         self.save_state()
         self.recompute()
 
     def _compute_opponent_prior(self) -> Optional[List[float]]:
-        counts = self.opponent_cell_counts
-        if not counts:
+        if self._opponent_profile_mismatch:
             self._using_opponent_prior = False
             self._opponent_prior_confidence = 0.0
             self._opponent_prior_total = 0.0
             return None
 
-        total = float(sum(counts))
-        self._opponent_prior_total = total
-        if total <= 0.0:
+        profile = self.opponents.get(self.active_opponent_id or "", {})
+        if not isinstance(profile, dict):
+            self._using_opponent_prior = False
+            self._opponent_prior_confidence = 0.0
+            self._opponent_prior_total = 0.0
+            return None
+        profile = self._normalize_opponent_profile(profile)
+
+        total_cells = self.board_size * self.board_size
+        expected_cells = max(1, int(self._expected_ship_cells()))
+
+        layout_masks = profile.get("layout_masks", [])
+        weighted_counts = [0.0] * total_cells
+        neighbor_counts = [0.0] * total_cells
+        effective_total = 0.0
+
+        if isinstance(layout_masks, list) and layout_masks:
+            half_life = max(1.0, float(OPPONENT_RECENCY_HALFLIFE))
+            decay = math.log(2.0) / half_life
+            n_masks = len(layout_masks)
+            for idx, mask in enumerate(layout_masks):
+                if not isinstance(mask, int):
+                    continue
+                age = (n_masks - 1) - idx
+                weight = math.exp(-decay * age)
+                for cell_idx in _iter_mask_indices(mask):
+                    if 0 <= cell_idx < total_cells:
+                        weighted_counts[cell_idx] += weight
+                    r = cell_idx // self.board_size
+                    c = cell_idx % self.board_size
+                    for dr, dc in _NEARBY_OFFSETS:
+                        nr = r + dr
+                        nc = c + dc
+                        if 0 <= nr < self.board_size and 0 <= nc < self.board_size:
+                            nidx = cell_index(nr, nc, self.board_size)
+                            if 0 <= nidx < total_cells:
+                                neighbor_counts[nidx] += weight
+                effective_total += weight * expected_cells
+        else:
+            counts = profile.get("cell_counts", [])
+            if isinstance(counts, list) and len(counts) == total_cells:
+                weighted_counts = [float(c) for c in counts]
+            nearby = profile.get("nearby_counts", [])
+            if isinstance(nearby, list) and len(nearby) == total_cells:
+                neighbor_counts = [float(c) for c in nearby]
+            effective_total = float(sum(weighted_counts))
+
+        self._opponent_prior_total = effective_total
+        if effective_total <= 0.0:
             self._using_opponent_prior = False
             self._opponent_prior_confidence = 0.0
             return None
 
-        total_cells = self.board_size * self.board_size
-        smoothing = 1.0
-        uniform = 1.0 / total_cells
-        denom = total + smoothing * total_cells
-        normalized = [(float(c) + smoothing) / denom for c in counts]
+        total_weighted = float(sum(weighted_counts))
+        if total_weighted <= 0.0:
+            self._using_opponent_prior = False
+            self._opponent_prior_confidence = 0.0
+            return None
 
-        # Confidence rises with more observed ship cells.
-        blend_k = max(1.0, float(self._expected_ship_cells()) * 6.0)
-        confidence = total / (total + blend_k)
+        normalized = [c / total_weighted for c in weighted_counts]
+        entropy = 0.0
+        for p in normalized:
+            if p > 0:
+                entropy -= p * math.log(p, 2)
+        max_entropy = math.log(total_cells, 2) if total_cells > 1 else 1.0
+        entropy_norm = entropy / max_entropy if max_entropy > 0 else 0.0
+        entropy_norm = max(0.0, min(1.0, entropy_norm))
+        self._opponent_prior_entropy = entropy_norm
+
+        blend_k = max(1.0, float(expected_cells) * 6.0)
+        confidence = effective_total / (effective_total + blend_k)
         confidence = max(0.0, min(1.0, confidence))
+        confidence *= (1.0 - entropy_norm)
         self._opponent_prior_confidence = confidence
-        self._using_opponent_prior = True
+        self._using_opponent_prior = confidence > 0.0
 
+        occupancy = [p * expected_cells for p in normalized]
         if confidence <= 0.0:
             return None
-        if confidence >= 1.0:
-            return normalized
-        return [confidence * normalized[i] + (1.0 - confidence) * uniform for i in range(total_cells)]
+
+        # Optional sharpening based on consistency.
+        layouts = max(1, int(profile.get("layouts_recorded", 0)))
+        clump_sum = float(profile.get("clump_score_sum", 0.0))
+        clump_sumsq = float(profile.get("clump_score_sumsq", 0.0))
+        clump_mean = clump_sum / layouts
+        clump_var = max(0.0, (clump_sumsq / layouts) - clump_mean ** 2)
+        var_norm = min(1.0, clump_var / 0.25)
+        temperature = 1.2 - (0.7 * confidence) + (0.3 * var_norm)
+        temperature = max(0.6, min(1.4, temperature))
+        if abs(temperature - 1.0) > 1e-6:
+            pow_inv = 1.0 / temperature
+            sharpened = [max(0.0, p) ** pow_inv for p in normalized]
+            denom = sum(sharpened)
+            if denom > 0:
+                occupancy = [(p / denom) * expected_cells for p in sharpened]
+
+        neighbor_total = float(sum(neighbor_counts))
+        if neighbor_total > 0:
+            neighbor_norm = [c / neighbor_total for c in neighbor_counts]
+            neighbor_occ = [p * expected_cells for p in neighbor_norm]
+            adjacent_sum = float(profile.get("adjacent_pairs_sum", 0.0))
+            mean_adjacent = adjacent_sum / layouts if layouts > 0 else 0.0
+            clump_score = mean_adjacent / float(expected_cells)
+            lam = max(0.0, min(0.6, clump_score))
+            occupancy = [(1.0 - lam) * occupancy[i] + lam * neighbor_occ[i] for i in range(total_cells)]
+
+        uniform = float(expected_cells) / float(total_cells)
+        final = [confidence * occupancy[i] + (1.0 - confidence) * uniform for i in range(total_cells)]
+        return final
 
     def _rollout_settings_changed(self) -> None:
         self.rollout_enabled = bool(self.rollout_enable_cb.isChecked())
@@ -1654,9 +2221,17 @@ class AttackTab(QtWidgets.QWidget):
 
         N = self.num_world_samples
         is_target_mode = self._is_target_mode(unknown_cells)
+        use_combined = (
+            (not is_target_mode)
+            and isinstance(self.combined_probs, list)
+            and len(self.combined_probs) == self.board_size * self.board_size
+        )
 
         def p_hit(r: int, c: int) -> float:
-            return self.cell_probs[cell_index(r, c, self.board_size)]
+            idx = cell_index(r, c, self.board_size)
+            if use_combined:
+                return float(self.combined_probs[idx])
+            return self.cell_probs[idx]
 
         candidates: List[Dict[str, object]] = []
 
@@ -1699,6 +2274,7 @@ class AttackTab(QtWidgets.QWidget):
                 has_any_hit=bool(hit_mask),
                 hit_mask=hit_mask,
                 miss_mask=miss_mask,
+                opponent_prior=self._opponent_prior if use_combined else None,
             )
             if self.board[r][c] != EMPTY:
                 r, c = random.choice(unknown_cells)
@@ -2607,10 +3183,19 @@ class AttackTab(QtWidgets.QWidget):
         assigned_hits_copy = {s: set(coords) for s, coords in self.assigned_hits.items()}
         confirmed_sunk_copy = set(self.confirmed_sunk)
 
-        cell_prior = self._compute_opponent_prior()
+        unknown_cells = [
+            (r, c)
+            for r in range(self.board_size)
+            for c in range(self.board_size)
+            if self.board[r][c] == EMPTY
+        ]
+        is_target_mode = self._is_target_mode(unknown_cells)
+        use_opponent_prior = not is_target_mode
+
+        opponent_prior = self._compute_opponent_prior() if use_opponent_prior else None
+        self._opponent_prior = list(opponent_prior) if isinstance(opponent_prior, list) else None
+        cell_prior = None
         prior_key = None
-        if cell_prior is not None:
-            prior_key = tuple(int(v) for v in self.opponent_cell_counts)
 
         phase = classify_phase(
             self.board,
@@ -2635,6 +3220,8 @@ class AttackTab(QtWidgets.QWidget):
             "confirmed_sunk": confirmed_sunk_copy,
             "assigned_hits": assigned_hits_copy,
             "cell_prior": cell_prior,
+            "opponent_prior": opponent_prior,
+            "use_opponent_prior": use_opponent_prior,
             "placement_index": self._placement_index,
             "target_worlds": WORLD_SAMPLE_TARGET,
             "cache_key": self._world_cache_key,
@@ -2687,6 +3274,8 @@ class AttackTab(QtWidgets.QWidget):
         self.ship_sunk_probs = result.get("ship_sunk_probs", {})
         self.num_world_samples = int(result.get("num_world_samples", 0))
         self.cell_probs = result.get("cell_probs", [])
+        self.combined_probs = result.get("combined_probs", list(self.cell_probs))
+        self._opponent_prior_alpha = float(result.get("prior_alpha", 1.0))
         self.info_gain_values = result.get("info_gain_values", [])
         self.enumeration_mode = bool(result.get("enumeration_mode", False))
         self.remaining_ship_count = int(result.get("remaining_ship_count", len(self.ship_ids)))
@@ -3068,12 +3657,22 @@ class AttackTab(QtWidgets.QWidget):
 
 
 class OpponentLayoutDialog(QtWidgets.QDialog):
-    def __init__(self, board_size: int, expected_cells: int, parent=None):
+    def __init__(
+        self,
+        board_size: int,
+        expected_cells: int,
+        heatmap: Optional[List[float]] = None,
+        last_layout_mask: Optional[int] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.board_size = int(board_size)
         self.expected_cells = int(expected_cells)
         self._selected = [[False for _ in range(self.board_size)] for _ in range(self.board_size)]
         self._buttons: List[List[QtWidgets.QToolButton]] = []
+        self._heatmap = list(heatmap) if isinstance(heatmap, list) else None
+        self._undo_stack: List[Tuple[int, int, bool]] = []
+        self._last_layout_mask = int(last_layout_mask) if isinstance(last_layout_mask, int) else None
 
         self.setWindowTitle("Record opponent layout")
         self.setModal(True)
@@ -3093,6 +3692,11 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
         self.count_label = QtWidgets.QLabel("")
         self.count_label.setWordWrap(True)
         layout.addWidget(self.count_label)
+
+        self.warning_label = QtWidgets.QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet(f"color: {Theme.STATUS_SUNK_MAYBE};")
+        layout.addWidget(self.warning_label)
 
         board_container = QtWidgets.QWidget()
         board_layout = QtWidgets.QGridLayout(board_container)
@@ -3120,6 +3724,7 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
                 btn = QtWidgets.QToolButton()
                 btn.setCheckable(True)
                 btn.setFixedSize(cell, cell)
+                btn._cell_index = cell_index(r, c, self.board_size)
                 btn.clicked.connect(self._make_toggle_handler(r, c))
                 self._apply_cell_style(btn, False)
                 board_layout.addWidget(btn, r + 1, c + 1)
@@ -3129,6 +3734,13 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
         layout.addWidget(board_container)
 
         action_row = QtWidgets.QHBoxLayout()
+        undo_btn = QtWidgets.QPushButton("Undo last")
+        undo_btn.clicked.connect(self._undo_last)
+        action_row.addWidget(undo_btn)
+        if self._last_layout_mask is not None:
+            import_btn = QtWidgets.QPushButton("Load last layout")
+            import_btn.clicked.connect(self._load_last_layout)
+            action_row.addWidget(import_btn)
         clear_btn = QtWidgets.QPushButton("Clear")
         clear_btn.clicked.connect(self._clear_cells)
         action_row.addWidget(clear_btn)
@@ -3141,12 +3753,16 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
 
         layout.addLayout(action_row)
 
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, activated=self._undo_last)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Backspace"), self, activated=self._undo_last)
+
         self._update_count_label()
 
     def _make_toggle_handler(self, r: int, c: int):
         def handler():
             btn = self._buttons[r][c]
             checked = btn.isChecked()
+            self._undo_stack.append((r, c, self._selected[r][c]))
             self._selected[r][c] = checked
             self._apply_cell_style(btn, checked)
             self._update_count_label()
@@ -3160,9 +3776,20 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
                 f"border: 1px solid {Theme.LAYOUT_SHIP_BORDER};"
             )
         else:
+            heat_val = 0.0
+            if self._heatmap and len(self._heatmap) == self.board_size * self.board_size:
+                idx = getattr(btn, "_cell_index", None)
+                if isinstance(idx, int) and 0 <= idx < len(self._heatmap):
+                    heat_val = float(self._heatmap[idx])
+            if heat_val > 0:
+                bg = _heat_color(heat_val)
+                text = Theme.TEXT_DARK if heat_val > 0.6 else Theme.TEXT_MAIN
+            else:
+                bg = Theme.BG_DARK
+                text = Theme.TEXT_MAIN
             btn.setStyleSheet(
-                f"background-color: {Theme.BG_DARK};"
-                f"color: {Theme.TEXT_MAIN};"
+                f"background-color: {bg};"
+                f"color: {text};"
                 f"border: 1px solid {Theme.BORDER_EMPTY};"
             )
 
@@ -3173,6 +3800,38 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
                 btn = self._buttons[r][c]
                 btn.setChecked(False)
                 self._apply_cell_style(btn, False)
+        self._undo_stack.clear()
+        self._update_count_label()
+
+    def _undo_last(self) -> None:
+        if not self._undo_stack:
+            return
+        r, c, prev_state = self._undo_stack.pop()
+        if not (0 <= r < self.board_size and 0 <= c < self.board_size):
+            return
+        self._selected[r][c] = prev_state
+        btn = self._buttons[r][c]
+        btn.blockSignals(True)
+        btn.setChecked(prev_state)
+        btn.blockSignals(False)
+        self._apply_cell_style(btn, prev_state)
+        self._update_count_label()
+
+    def _load_last_layout(self) -> None:
+        if self._last_layout_mask is None:
+            return
+        mask = int(self._last_layout_mask)
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                idx = cell_index(r, c, self.board_size)
+                selected = bool((mask >> idx) & 1)
+                self._selected[r][c] = selected
+                btn = self._buttons[r][c]
+                btn.blockSignals(True)
+                btn.setChecked(selected)
+                btn.blockSignals(False)
+                self._apply_cell_style(btn, selected)
+        self._undo_stack.clear()
         self._update_count_label()
 
     def _update_count_label(self) -> None:
@@ -3181,6 +3840,27 @@ class OpponentLayoutDialog(QtWidgets.QDialog):
             self.count_label.setText(f"Selected ship cells: {count} / {self.expected_cells}")
         else:
             self.count_label.setText(f"Selected ship cells: {count}")
+        self._update_warning_label()
+
+    def _update_warning_label(self) -> None:
+        if self.expected_cells <= 0:
+            self.warning_label.setText("")
+            return
+        mask = 0
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self._selected[r][c]:
+                    mask |= 1 << cell_index(r, c, self.board_size)
+        sizes = _connected_components_sizes(mask, self.board_size)
+        if not sizes:
+            self.warning_label.setText("")
+            return
+        singles = sum(1 for s in sizes if s == 1)
+        clusters = len(sizes)
+        if singles >= max(3, int(0.6 * self.expected_cells)) or clusters >= max(4, int(0.6 * self.expected_cells)):
+            self.warning_label.setText("Warning: selection looks highly fragmented. Double-check ship shapes.")
+        else:
+            self.warning_label.setText("")
 
     def selected_cells(self) -> List[Tuple[int, int]]:
         cells: List[Tuple[int, int]] = []

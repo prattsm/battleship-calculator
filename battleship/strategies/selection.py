@@ -229,6 +229,7 @@ def _choose_next_shot_for_strategy(
     has_any_hit: Optional[bool] = None,
     hit_mask: Optional[int] = None,
     miss_mask: Optional[int] = None,
+    opponent_prior: Optional[List[float]] = None,
 ) -> Tuple[int, int]:
     """
     Choose the next shot for the given strategy using the current board state.
@@ -449,9 +450,14 @@ def _choose_next_shot_for_strategy(
                         if 0 <= cand_r < board_size and board[cand_r][c0] == EMPTY:
                             endpoint_idxs.add(cell_index(cand_r, c0, board_size))
         center = (board_size - 1) / 2.0
+        max_count = max(counts) if counts else 0
         for r, c in unknown_cells:
             idx = cell_index(r, c, board_size)
             score = counts[idx]
+            if combined_probs is not None and max_count > 0 and not is_target_mode:
+                norm_count = score / max_count
+                mix = 0.35
+                score = (1.0 - mix) * norm_count + mix * combined_probs[idx]
             if score < 0:
                 continue
             is_endpoint = 1 if idx in endpoint_idxs else 0
@@ -589,6 +595,19 @@ def _choose_next_shot_for_strategy(
     if is_target_mode and strategy == "entropy1":
         strategy = "greedy"
 
+    combined_probs: Optional[List[float]] = None
+    if (
+        opponent_prior is not None
+        and isinstance(opponent_prior, list)
+        and len(opponent_prior) == total_cells
+        and not is_target_mode
+    ):
+        alpha = max(0.2, min(0.95, N / (N + 1200.0)))
+        combined_probs = [
+            alpha * cell_probs[i] + (1.0 - alpha) * float(opponent_prior[i])
+            for i in range(total_cells)
+        ]
+
     def _entropy_score_idx(idx: int) -> float:
         n_hit = cell_hit_counts[idx]
         if n_hit <= 0 or n_hit >= N:
@@ -613,7 +632,8 @@ def _choose_next_shot_for_strategy(
         for r, c in unknown_cells:
             idx = cell_index(r, c, board_size)
             key = (r + c) % min_len
-            buckets[key] = buckets.get(key, 0.0) + cell_probs[idx]
+            prob = combined_probs[idx] if combined_probs is not None else cell_probs[idx]
+            buckets[key] = buckets.get(key, 0.0) + prob
         if not buckets:
             return None
         best_bucket = max(buckets.items(), key=lambda kv: kv[1])[0]
