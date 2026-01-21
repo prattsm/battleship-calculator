@@ -289,6 +289,7 @@ def _choose_next_shot_for_strategy(
     if hit_cells is None and hit_mask:
         hit_cells = _mask_to_cells(hit_mask, board_size)
     neighbors = _neighbors4(board_size)
+    combined_probs: Optional[List[float]] = None
 
     def _adjacent_hits(cell: Tuple[int, int], hit_set: Set[Tuple[int, int]]) -> int:
         idx = cell_index(cell[0], cell[1], board_size)
