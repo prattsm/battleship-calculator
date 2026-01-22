@@ -993,9 +993,19 @@ class AttackTab(QtWidgets.QWidget):
         sunk_layout = QtWidgets.QVBoxLayout(sunk_group)
         self.sunk_checkboxes = {}
         for ship in self.ship_ids:
+            row = QtWidgets.QHBoxLayout()
+            swatch = QtWidgets.QLabel("")
+            swatch.setFixedSize(12, 12)
+            color = self.ship_colors.get(ship, Theme.ASSIGNED_BORDER)
+            swatch.setStyleSheet(
+                f"background-color: {color}; border: 1px solid {Theme.BORDER_EMPTY}; border-radius: 6px;"
+            )
             cb = QtWidgets.QCheckBox(self.ship_friendly_names[ship])
             cb.stateChanged.connect(self._make_sunk_handler(ship))
-            sunk_layout.addWidget(cb)
+            row.addWidget(swatch)
+            row.addWidget(cb)
+            row.addStretch(1)
+            sunk_layout.addLayout(row)
             self.sunk_checkboxes[ship] = cb
         ships_layout.addWidget(sunk_group)
 
@@ -1012,25 +1022,6 @@ class AttackTab(QtWidgets.QWidget):
             assign_layout.addWidget(rb)
             self.assign_ship_rbs[ship] = rb
         ships_layout.addWidget(assign_group)
-
-        colors_group = QtWidgets.QGroupBox("Ship colors")
-        colors_layout = QtWidgets.QVBoxLayout(colors_group)
-        self.ship_color_swatches = {}
-        for ship in self.ship_ids:
-            row = QtWidgets.QHBoxLayout()
-            swatch = QtWidgets.QLabel("")
-            swatch.setFixedSize(14, 14)
-            color = self.ship_colors.get(ship, Theme.ASSIGNED_BORDER)
-            swatch.setStyleSheet(
-                f"background-color: {color}; border: 1px solid {Theme.BORDER_EMPTY};"
-            )
-            label = QtWidgets.QLabel(self.ship_friendly_names[ship])
-            row.addWidget(swatch)
-            row.addWidget(label)
-            row.addStretch(1)
-            colors_layout.addLayout(row)
-            self.ship_color_swatches[ship] = swatch
-        ships_layout.addWidget(colors_group)
 
         status_group = QtWidgets.QGroupBox("Ship status (sunk probability)")
         status_layout = QtWidgets.QVBoxLayout(status_group)
