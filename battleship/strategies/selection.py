@@ -513,10 +513,21 @@ def _choose_next_shot_for_strategy(
         strategy = "greedy"
 
     if strategy == "placement_factorized":
-        choice = _choose_placement_factorized()
+        if is_target_mode:
+            choice = _choose_assigned_target_marginal()
+            if choice is not None:
+                return choice
+            strategy = "greedy"
+        else:
+            choice = _choose_placement_factorized()
+            if choice is not None:
+                return choice
+            return rng.choice(unknown_cells)
+    if strategy == "minlen_parity_entropy" and is_target_mode:
+        choice = _choose_assigned_target_marginal()
         if choice is not None:
             return choice
-        return rng.choice(unknown_cells)
+        strategy = "greedy"
     if not has_any_hit and strategy in {"random_checkerboard", "systematic_checkerboard", "diagonal_stripe"}:
         if strategy == "random_checkerboard":
             whites = [(r, c) for (r, c) in unknown_cells if (r + c) % 2 == 0]
