@@ -2270,6 +2270,36 @@ class AttackTab(QtWidgets.QWidget):
                 break
         return forced
 
+    def _possible_mask_for_sunk_ship(self, ship: str, hit_mask: int, miss_mask: int) -> int:
+        placements = self.placements.get(ship, [])
+        if not placements:
+            return 0
+
+        required_cells = self.assigned_hits.get(ship, set())
+        required_mask = make_mask(list(required_cells), self.board_size) if required_cells else 0
+
+        blocked_mask = 0
+        for other, cells in self.assigned_hits.items():
+            if other == ship or not cells:
+                continue
+            blocked_mask |= make_mask(list(cells), self.board_size)
+
+        possible = 0
+        for p in placements:
+            pmask = getattr(p, "mask", 0)
+            if not isinstance(pmask, int):
+                continue
+            if pmask & miss_mask:
+                continue
+            if blocked_mask and (pmask & blocked_mask):
+                continue
+            if (pmask & ~hit_mask) != 0:
+                continue
+            if required_mask and (required_mask & ~pmask) != 0:
+                continue
+            possible |= pmask
+        return possible
+
     def _auto_assign_sunk_hits(self) -> bool:
         if not self.confirmed_sunk:
             # Still allow forced assignment when only one ship remains.
@@ -2309,10 +2339,16 @@ class AttackTab(QtWidgets.QWidget):
             assigned_all: Set[Tuple[int, int]] = set()
             for cells in self.assigned_hits.values():
                 assigned_all.update(cells)
+            possible_sunk_mask = 0
+            for ship in self.confirmed_sunk:
+                possible_sunk_mask |= self._possible_mask_for_sunk_ship(ship, hit_mask, miss_mask)
             unassigned_hits: List[Tuple[int, int]] = []
             for r in range(self.board_size):
                 for c in range(self.board_size):
                     if self.board[r][c] == HIT and (r, c) not in assigned_all:
+                        idx = cell_index(r, c, self.board_size)
+                        if (possible_sunk_mask >> idx) & 1:
+                            continue
                         unassigned_hits.append((r, c))
             if unassigned_hits:
                 ship_set = self.assigned_hits.get(target_ship)

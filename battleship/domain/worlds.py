@@ -44,10 +44,19 @@ def filter_allowed_placements(
     placement_index: Optional[Dict[str, Dict[int, List[int]]]] = None,
 ) -> Dict[str, List[PlacementLike]]:
     filtered: Dict[str, List[PlacementLike]] = {}
+    assigned_masks: Dict[str, int] = {
+        ship: make_mask(list(cells), board_size) if cells else 0
+        for ship, cells in assigned_hits.items()
+    }
     for ship, plist in placements.items():
         required_cells = assigned_hits.get(ship, set())
-        required_mask = make_mask(list(required_cells), board_size) if required_cells else 0
+        required_mask = assigned_masks.get(ship, 0)
         is_sunk = ship in confirmed_sunk
+        blocked_mask = 0
+        for other, mask in assigned_masks.items():
+            if other == ship or not mask:
+                continue
+            blocked_mask |= mask
         candidates = plist
         if required_cells and placement_index:
             cell_map = placement_index.get(ship) or {}
@@ -72,11 +81,17 @@ def filter_allowed_placements(
             # cannot overlap misses
             if p.mask & miss_mask:
                 continue
+            # cannot overlap cells assigned to other ships
+            if blocked_mask and (p.mask & blocked_mask):
+                continue
             # must cover all assigned hits for this ship
             if required_mask and (required_mask & ~p.mask) != 0:
                 continue
             # if user marked ship sunk, placement must lie entirely on hits
             if is_sunk and (p.mask & ~hit_mask) != 0:
+                continue
+            # if ship is not sunk, placement must include at least one un-hit cell
+            if not is_sunk and (p.mask & ~hit_mask) == 0:
                 continue
             new_list.append(p)
         filtered[ship] = new_list

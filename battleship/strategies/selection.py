@@ -7,7 +7,11 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from battleship.domain.board import cell_index
 from battleship.domain.config import BOARD_SIZE, EMPTY, HIT, MISS
-from battleship.domain.worlds import compute_min_expected_worlds_after_one_shot, sample_worlds
+from battleship.domain.worlds import (
+    compute_min_expected_worlds_after_one_shot,
+    filter_allowed_placements,
+    sample_worlds,
+)
 
 
 @dataclass
@@ -290,6 +294,20 @@ def _choose_next_shot_for_strategy(
         hit_cells = _mask_to_cells(hit_mask, board_size)
     neighbors = _neighbors4(board_size)
     combined_probs: Optional[List[float]] = None
+    allowed: Optional[Dict[str, List[object]]] = None
+
+    def _get_allowed() -> Dict[str, List[object]]:
+        nonlocal allowed
+        if allowed is None:
+            allowed = filter_allowed_placements(
+                placements,
+                hit_mask,
+                miss_mask,
+                confirmed_sunk,
+                assigned_hits,
+                board_size=board_size,
+            )
+        return allowed
 
     def _adjacent_hits(cell: Tuple[int, int], hit_set: Set[Tuple[int, int]]) -> int:
         idx = cell_index(cell[0], cell[1], board_size)
@@ -323,7 +341,7 @@ def _choose_next_shot_for_strategy(
             req_mask = _mask_from_cells(hits, board_size)
             counts = [0] * total_cells
             total = 0
-            for p in placements.get(ship, []):
+            for p in _get_allowed().get(ship, []):
                 pmask = getattr(p, "mask", 0)
                 if pmask & miss_mask:
                     continue
@@ -398,7 +416,7 @@ def _choose_next_shot_for_strategy(
         counts = [0] * total_cells
         for ship in active_ships:
             req_mask = _mask_from_cells(assigned_hits.get(ship, set()), board_size)
-            for p in placements.get(ship, []):
+            for p in _get_allowed().get(ship, []):
                 pmask = getattr(p, "mask", 0)
                 if pmask & miss_mask:
                     continue
@@ -666,7 +684,7 @@ def _choose_next_shot_for_strategy(
         for ship in active_ships:
             req_mask = _mask_from_cells(assigned_hits.get(ship, set()), board_size)
             ship_masks: List[int] = []
-            for p in placements.get(ship, []):
+            for p in _get_allowed().get(ship, []):
                 pmask = getattr(p, "mask", 0)
                 if pmask & miss_mask:
                     continue
