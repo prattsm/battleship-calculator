@@ -292,6 +292,17 @@ def _choose_next_shot_for_strategy(
     unknown_mask = ((1 << total_cells) - 1) & ~(hit_mask | miss_mask)
     if hit_cells is None and hit_mask:
         hit_cells = _mask_to_cells(hit_mask, board_size)
+    resolved_hits: Set[Tuple[int, int]] = set()
+    if confirmed_sunk and assigned_hits:
+        for ship in confirmed_sunk:
+            resolved_hits.update(assigned_hits.get(ship, set()))
+    unresolved_hits = False
+    if hit_cells:
+        for cell in hit_cells:
+            if cell not in resolved_hits:
+                unresolved_hits = True
+                break
+    is_target_mode = bool(unresolved_hits)
     neighbors = _neighbors4(board_size)
     combined_probs: Optional[List[float]] = None
     allowed: Optional[Dict[str, List[object]]] = None
@@ -617,7 +628,7 @@ def _choose_next_shot_for_strategy(
     comp_thresh = _param_int(params, "target_component_min", "SIM_TARGET_COMPONENT_MIN", 2)
 
     live_hits = len(live_hit_set)
-    is_target_mode = False
+    is_target_mode = bool(unresolved_hits)
     if live_hits >= min_hits and live_hits > 0:
         if frontier_mass >= mass_thresh or frontier_max >= max_thresh or max_component >= comp_thresh:
             is_target_mode = True
