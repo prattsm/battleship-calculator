@@ -682,6 +682,7 @@ class AttackTab(QtWidgets.QWidget):
             spec.instance_id: (spec.name or spec.instance_id)
             for spec in self.layout.ships
         }
+        self.ship_colors = self._build_ship_colors()
 
         self._build_ui()
         self._update_model_controls()
@@ -998,7 +999,7 @@ class AttackTab(QtWidgets.QWidget):
             self.sunk_checkboxes[ship] = cb
         ships_layout.addWidget(sunk_group)
 
-        assign_group = QtWidgets.QGroupBox("Assign hits to ships (optional)")
+        assign_group = QtWidgets.QGroupBox("Assign hits to ships (auto when forced)")
         assign_layout = QtWidgets.QVBoxLayout(assign_group)
         self.assign_none_rb = QtWidgets.QRadioButton("No assignment mode")
         self.assign_none_rb.setChecked(True)
@@ -1011,6 +1012,25 @@ class AttackTab(QtWidgets.QWidget):
             assign_layout.addWidget(rb)
             self.assign_ship_rbs[ship] = rb
         ships_layout.addWidget(assign_group)
+
+        colors_group = QtWidgets.QGroupBox("Ship colors")
+        colors_layout = QtWidgets.QVBoxLayout(colors_group)
+        self.ship_color_swatches = {}
+        for ship in self.ship_ids:
+            row = QtWidgets.QHBoxLayout()
+            swatch = QtWidgets.QLabel("")
+            swatch.setFixedSize(14, 14)
+            color = self.ship_colors.get(ship, Theme.ASSIGNED_BORDER)
+            swatch.setStyleSheet(
+                f"background-color: {color}; border: 1px solid {Theme.BORDER_EMPTY};"
+            )
+            label = QtWidgets.QLabel(self.ship_friendly_names[ship])
+            row.addWidget(swatch)
+            row.addWidget(label)
+            row.addStretch(1)
+            colors_layout.addLayout(row)
+            self.ship_color_swatches[ship] = swatch
+        ships_layout.addWidget(colors_group)
 
         status_group = QtWidgets.QGroupBox("Ship status (sunk probability)")
         status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -2139,7 +2159,11 @@ class AttackTab(QtWidgets.QWidget):
         elif new_state != HIT:
             for ship in self.ship_ids:
                 self.assigned_hits[ship].discard((r, c))
-        self._update_cells_view([(r, c)])
+        auto_changed = self._auto_assign_sunk_hits()
+        if auto_changed:
+            self.update_board_view()
+        else:
+            self._update_cells_view([(r, c)])
         self._schedule_recompute()
 
     def _toggle_assignment(self, ship: str, r: int, c: int):
@@ -2161,14 +2185,168 @@ class AttackTab(QtWidgets.QWidget):
                 total += len(spec.cells or [])
         return total
 
+    @staticmethod
+    def _hsl_to_hex(h: float, s: float, l: float) -> str:
+        h = h % 360.0
+        s = max(0.0, min(1.0, s))
+        l = max(0.0, min(1.0, l))
+        c = (1.0 - abs(2.0 * l - 1.0)) * s
+        h_prime = h / 60.0
+        x = c * (1.0 - abs((h_prime % 2.0) - 1.0))
+        if 0 <= h_prime < 1:
+            r1, g1, b1 = c, x, 0.0
+        elif 1 <= h_prime < 2:
+            r1, g1, b1 = x, c, 0.0
+        elif 2 <= h_prime < 3:
+            r1, g1, b1 = 0.0, c, x
+        elif 3 <= h_prime < 4:
+            r1, g1, b1 = 0.0, x, c
+        elif 4 <= h_prime < 5:
+            r1, g1, b1 = x, 0.0, c
+        else:
+            r1, g1, b1 = c, 0.0, x
+        m = l - (c / 2.0)
+        r = int(round((r1 + m) * 255))
+        g = int(round((g1 + m) * 255))
+        b = int(round((b1 + m) * 255))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @classmethod
+    def _generate_distinct_colors(cls, count: int) -> List[str]:
+        if count <= 0:
+            return []
+        colors: List[str] = []
+        if count <= 12:
+            for i in range(count):
+                hue = (360.0 * i) / count
+                colors.append(cls._hsl_to_hex(hue, 0.75, 0.58))
+            return colors
+
+        band_l = [0.55, 0.68]
+        for i in range(count):
+            hue = (360.0 * i) / count
+            light = band_l[i % len(band_l)]
+            colors.append(cls._hsl_to_hex(hue, 0.72, light))
+        return colors
+
+    def _build_ship_colors(self) -> Dict[str, str]:
+        colors = self._generate_distinct_colors(len(self.ship_ids))
+        return {ship: colors[i] for i, ship in enumerate(self.ship_ids)}
+
+    def _assigned_cell_map(self) -> Dict[Tuple[int, int], str]:
+        assigned: Dict[Tuple[int, int], str] = {}
+        for ship in self.ship_ids:
+            for cell in self.assigned_hits.get(ship, set()):
+                assigned.setdefault(cell, ship)
+        return assigned
+
+    def _forced_mask_for_sunk_ship(self, ship: str, hit_mask: int, miss_mask: int) -> int:
+        placements = self.placements.get(ship, [])
+        if not placements:
+            return 0
+
+        required_cells = self.assigned_hits.get(ship, set())
+        required_mask = make_mask(list(required_cells), self.board_size) if required_cells else 0
+
+        blocked_mask = 0
+        for other, cells in self.assigned_hits.items():
+            if other == ship or not cells:
+                continue
+            blocked_mask |= make_mask(list(cells), self.board_size)
+
+        candidates: List[int] = []
+        for p in placements:
+            pmask = getattr(p, "mask", 0)
+            if not isinstance(pmask, int):
+                continue
+            if pmask & miss_mask:
+                continue
+            if pmask & blocked_mask:
+                continue
+            if (pmask & ~hit_mask) != 0:
+                continue
+            if required_mask and (required_mask & ~pmask) != 0:
+                continue
+            candidates.append(pmask)
+
+        if not candidates:
+            return 0
+
+        forced = candidates[0]
+        for m in candidates[1:]:
+            forced &= m
+            if forced == 0:
+                break
+        return forced
+
+    def _auto_assign_sunk_hits(self) -> bool:
+        if not self.confirmed_sunk:
+            # Still allow forced assignment when only one ship remains.
+            has_sunk = False
+        else:
+            has_sunk = True
+
+        hit_mask, miss_mask = board_masks(self.board, self.board_size)
+        changed = False
+
+        # Iterate to propagate assignments that unlock other forced cells.
+        if has_sunk:
+            while True:
+                progressed = False
+                for ship in self.ship_ids:
+                    if ship not in self.confirmed_sunk:
+                        continue
+                    forced_mask = self._forced_mask_for_sunk_ship(ship, hit_mask, miss_mask)
+                    if not forced_mask:
+                        continue
+                    forced_cells = _mask_to_cells(forced_mask, self.board_size)
+                    ship_set = self.assigned_hits.get(ship)
+                    if ship_set is None:
+                        ship_set = set()
+                        self.assigned_hits[ship] = ship_set
+                    new_cells = [cell for cell in forced_cells if cell not in ship_set]
+                    if new_cells:
+                        ship_set.update(new_cells)
+                        progressed = True
+                        changed = True
+                if not progressed:
+                    break
+
+        remaining = [s for s in self.ship_ids if s not in self.confirmed_sunk]
+        if len(remaining) == 1:
+            target_ship = remaining[0]
+            assigned_all: Set[Tuple[int, int]] = set()
+            for cells in self.assigned_hits.values():
+                assigned_all.update(cells)
+            unassigned_hits: List[Tuple[int, int]] = []
+            for r in range(self.board_size):
+                for c in range(self.board_size):
+                    if self.board[r][c] == HIT and (r, c) not in assigned_all:
+                        unassigned_hits.append((r, c))
+            if unassigned_hits:
+                ship_set = self.assigned_hits.get(target_ship)
+                if ship_set is None:
+                    ship_set = set()
+                    self.assigned_hits[target_ship] = ship_set
+                new_cells = [cell for cell in unassigned_hits if cell not in ship_set]
+                if new_cells:
+                    ship_set.update(new_cells)
+                    changed = True
+
+        return changed
+
     def _is_target_mode(self, unknown_cells: Sequence[Tuple[int, int]]) -> bool:
         if not unknown_cells:
             return False
-        has_any_hit = any(
-            self.board[r][c] == HIT for r in range(self.board_size) for c in range(self.board_size)
-        )
-        max_p = max(self.cell_probs[cell_index(r, c, self.board_size)] for r, c in unknown_cells)
-        return has_any_hit and (max_p > 0.30)
+        resolved_hits: Set[Tuple[int, int]] = set()
+        for ship in self.confirmed_sunk:
+            resolved_hits.update(self.assigned_hits.get(ship, set()))
+
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self.board[r][c] == HIT and (r, c) not in resolved_hits:
+                    return True
+        return False
 
     def _get_model_name(self, key: Optional[str]) -> str:
         if not key:
@@ -2877,6 +3055,7 @@ class AttackTab(QtWidgets.QWidget):
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._update_history_buttons()
+        self._auto_assign_sunk_hits()
         self.update_board_view()
 
     def _record_game_result(self, win: bool):
@@ -2918,7 +3097,11 @@ class AttackTab(QtWidgets.QWidget):
             ):
                 self._push_history()
                 self._toggle_assignment(self.assign_mode_ship, r, c)
-                self._update_cells_view([(r, c)])
+                auto_changed = self._auto_assign_sunk_hits()
+                if auto_changed:
+                    self.update_board_view()
+                else:
+                    self._update_cells_view([(r, c)])
                 self._schedule_recompute()
                 return
 
@@ -2948,6 +3131,9 @@ class AttackTab(QtWidgets.QWidget):
                 self.confirmed_sunk.add(ship)
             else:
                 self.confirmed_sunk.discard(ship)
+            auto_changed = self._auto_assign_sunk_hits()
+            if auto_changed:
+                self.update_board_view()
             self._schedule_recompute()
 
         return handler
@@ -3471,7 +3657,7 @@ class AttackTab(QtWidgets.QWidget):
         show_hit_prob: bool,
         show_info_gain: bool,
         best_set: Set[Tuple[int, int]],
-        assigned_cells: Set[Tuple[int, int]],
+        assigned_map: Dict[Tuple[int, int], str],
     ) -> Tuple[str, str]:
         state = self.board[r][c]
         idx = cell_index(r, c, self.board_size)
@@ -3505,8 +3691,10 @@ class AttackTab(QtWidgets.QWidget):
             text_color = Theme.HIT_TEXT
             border_style = f"1px solid {Theme.HIT_BORDER}"
             text = "H"
-            if (r, c) in assigned_cells:
-                border_style = f"2px dashed {Theme.ASSIGNED_BORDER}"
+            ship = assigned_map.get((r, c))
+            if ship is not None:
+                color = self.ship_colors.get(ship, Theme.ASSIGNED_BORDER)
+                border_style = f"2px dashed {color}"
 
         style_str = (
             f"background-color: {base_color};"
@@ -3526,15 +3714,13 @@ class AttackTab(QtWidgets.QWidget):
         show_hit_prob = (overlay_mode == 1 and not self.game_over)
         show_info_gain = (overlay_mode == 2 and not self.game_over)
         best_set = {(r, c) for (r, c) in self.best_cells}
-        assigned_cells: Set[Tuple[int, int]] = set()
-        for sset in self.assigned_hits.values():
-            assigned_cells.update(sset)
+        assigned_map = self._assigned_cell_map()
         for r, c in cells:
             if not (0 <= r < self.board_size and 0 <= c < self.board_size):
                 continue
             btn = self.cell_buttons[r][c]
             style_str, text = self._cell_style_for_view(
-                r, c, show_hit_prob, show_info_gain, best_set, assigned_cells
+                r, c, show_hit_prob, show_info_gain, best_set, assigned_map
             )
             btn.setStyleSheet(style_str)
             btn.setText(text)
@@ -3570,15 +3756,13 @@ class AttackTab(QtWidgets.QWidget):
         show_info_gain = (overlay_mode == 2 and not self.game_over)
 
         best_set = {(r, c) for (r, c) in self.best_cells}
-        assigned_cells: Set[Tuple[int, int]] = set()
-        for sset in self.assigned_hits.values():
-            assigned_cells.update(sset)
+        assigned_map = self._assigned_cell_map()
 
         for r in range(self.board_size):
             for c in range(self.board_size):
                 btn = self.cell_buttons[r][c]
                 style_str, text = self._cell_style_for_view(
-                    r, c, show_hit_prob, show_info_gain, best_set, assigned_cells
+                    r, c, show_hit_prob, show_info_gain, best_set, assigned_map
                 )
                 btn.setStyleSheet(style_str)
                 btn.setText(text)
