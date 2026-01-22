@@ -2448,7 +2448,8 @@ class AttackTab(QtWidgets.QWidget):
             if self.board[r][c] != EMPTY:
                 r, c = random.choice(unknown_cells)
             candidates.append({"cell": (r, c), "p_hit": p_hit(r, c), "score": p_hit(r, c)})
-            note = "Selection engine"
+            mode_label = "Target mode" if is_target_mode else "Hunt mode"
+            note = f"{mode_label}: {self._get_model_name(model_key)}"
             return candidates, score_label, higher_better, note
 
         if model_key == "entropy1":
