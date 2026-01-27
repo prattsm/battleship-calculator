@@ -320,20 +320,17 @@ def sample_worlds(
             return [], [0] * (board_size * board_size), {s: 0.0 for s in ship_ids}, 0
 
     # Decide enumeration vs Monte Carlo
-    remaining_ships = [s for s in ship_ids if s not in confirmed_sunk]
-    force_enumeration = (len(remaining_ships) == 1)
-
     product = 1
     enumeration = True
-    if not force_enumeration:
-        for ship in ship_ids:
-            n = len(allowed[ship])
-            product *= n
-            if product > ENUMERATION_PRODUCT_LIMIT:
-                enumeration = False
-                break
-    else:
-        enumeration = True
+    for ship in ship_ids:
+        n = len(allowed[ship])
+        product *= n
+        if product > ENUMERATION_PRODUCT_LIMIT:
+            enumeration = False
+            break
+    # This naturally covers endgame cases: we enumerate when the full
+    # combination space is small, otherwise fall back to Monte Carlo
+    # to avoid biased truncation from capped enumeration.
 
     # If we have a cell prior, prefer Monte Carlo sampling to respect weights.
     if cell_prior is not None and len(cell_prior) == board_size * board_size:

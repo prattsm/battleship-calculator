@@ -353,18 +353,14 @@ def _compute_attack_recompute(payload: dict) -> dict:
             board_size,
             placement_index=placement_index,
         )
-        force_enumeration = (remaining_ship_count == 1)
         product = 1
         enumeration = True
-        if not force_enumeration:
-            for ship in ship_ids:
-                n = len(allowed[ship])
-                product *= n
-                if product > ENUMERATION_PRODUCT_LIMIT:
-                    enumeration = False
-                    break
-        else:
-            enumeration = True
+        for ship in ship_ids:
+            n = len(allowed[ship])
+            product *= n
+            if product > ENUMERATION_PRODUCT_LIMIT:
+                enumeration = False
+                break
         if cell_prior is not None:
             enumeration = False
     else:
