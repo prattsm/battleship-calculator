@@ -1,5 +1,7 @@
 import os
+import signal
 import sys
+import threading
 from typing import Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -52,6 +54,7 @@ def apply_dark_palette(app: QtWidgets.QApplication):
 
 class MainWindow(QtWidgets.QMainWindow):
     APP_STATE_PATH = "battleship_app_state.json"
+    AUTOSAVE_INTERVAL_MS = 15000
 
     def __init__(self):
         super().__init__()
@@ -65,6 +68,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.layout_runtime = DEFAULT_PLACEMENT_CACHE.get(self.layout_definition)
         self.match_state = load_match_state(self.APP_STATE_PATH)
         self._syncing_opponent = False
+        self._persisting_state = False
+        self._termination_requested = False
+        self._autosave_timer: Optional[QtCore.QTimer] = None
+        self._original_sys_excepthook = sys.excepthook
+        self._original_threading_excepthook = getattr(threading, "excepthook", None)
 
         central = QtWidgets.QWidget()
         root_layout = QtWidgets.QVBoxLayout(central)
@@ -95,6 +103,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_tabs()
         self._connect_live_match()
+        self._install_persistence_hooks()
 
     # We need to hook up the signal so AttackTab can see DefenseTab
     # Override the recompute connection in AttackTab
@@ -234,6 +243,54 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._set_active_match_opponent(self.attack_tab._current_opponent_name(), persist=False)
         self._update_match_status()
+
+    def _install_persistence_hooks(self) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(lambda: self._save_all_state("about_to_quit"))
+
+        self._autosave_timer = QtCore.QTimer(self)
+        self._autosave_timer.setInterval(self.AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(lambda: self._save_all_state("autosave"))
+        self._autosave_timer.start()
+
+        self._install_signal_handlers()
+        self._install_exception_hooks()
+
+    def _install_signal_handlers(self) -> None:
+        for sig_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._handle_process_signal)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    def _install_exception_hooks(self) -> None:
+        def excepthook(exc_type, exc_value, exc_traceback):
+            self._save_all_state("unhandled_exception")
+            self._original_sys_excepthook(exc_type, exc_value, exc_traceback)
+
+        sys.excepthook = excepthook
+
+        if self._original_threading_excepthook is None:
+            return
+
+        def threading_excepthook(args):
+            self._save_all_state("thread_exception")
+            self._original_threading_excepthook(args)
+
+        threading.excepthook = threading_excepthook
+
+    def _handle_process_signal(self, signum, _frame) -> None:
+        if self._termination_requested:
+            return
+        self._termination_requested = True
+        self._save_all_state(f"signal_{signum}")
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _refresh_match_opponents(self) -> None:
         names = []
@@ -458,6 +515,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             print("Error saving model stats:", e)
 
+    def _save_all_state(self, reason: str = "manual") -> None:
+        if self._persisting_state:
+            return
+        self._persisting_state = True
+        try:
+            self._save_tabs_state()
+            try:
+                save_match_state(self.APP_STATE_PATH, self.match_state)
+            except Exception as e:
+                print(f"Error saving match state during {reason}:", e)
+            try:
+                save_selected_layout(self.APP_STATE_PATH, self.layout_definition)
+            except Exception as e:
+                print(f"Error saving app state during {reason}:", e)
+            try:
+                self.stats.save()
+            except Exception as e:
+                print(f"Error saving stats during {reason}:", e)
+        finally:
+            self._persisting_state = False
+
     def _set_layout(self, layout: LayoutDefinition, persist: bool = True):
         if (
             layout.layout_id == self.layout_definition.layout_id
@@ -509,18 +587,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_layout(current_layout, persist=True)
 
     def closeEvent(self, event: QtGui.QCloseEvent):
-        self._save_tabs_state()
-
-        try:
-            save_selected_layout(self.APP_STATE_PATH, self.layout_definition)
-        except Exception as e:
-            print("Error saving app state:", e)
-
-        try:
-            self.stats.save()
-        except Exception as e:
-            print("Error saving stats:", e)
-
+        self._save_all_state("close_event")
         event.accept()
 
 

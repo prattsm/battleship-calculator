@@ -1,6 +1,6 @@
-import json
-import os
 from typing import Optional
+
+from battleship.persistence.io import atomic_write_json, load_json_file
 
 
 class StatsTracker:
@@ -14,12 +14,8 @@ class StatsTracker:
     def load(self, path: Optional[str] = None):
         if path is None:
             path = self.PATH
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        data = load_json_file(path)
+        if not isinstance(data, dict):
             return
         self.games = int(data.get("games", 0))
         self.wins = int(data.get("wins", 0))
@@ -28,11 +24,7 @@ class StatsTracker:
         if path is None:
             path = self.PATH
         data = {"games": self.games, "wins": self.wins}
-        try:
-            with open(path, "w") as f:
-                json.dump(data, f)
-        except OSError:
-            pass
+        atomic_write_json(path, data)
 
     def record_game(self, win: bool):
         self.games += 1
