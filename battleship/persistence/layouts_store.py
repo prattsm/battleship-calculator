@@ -1,9 +1,8 @@
-import json
-import os
 import uuid
 from typing import Any, Dict, List, Optional
 
 from battleship.layouts.definition import LayoutDefinition, ShipSpec, normalize_shape_cells
+from battleship.persistence.io import atomic_write_json, load_json_file
 
 
 CUSTOM_LAYOUTS_PATH = "battleship_custom_layouts.json"
@@ -103,12 +102,8 @@ def deserialize_layout(data: Dict[str, Any]) -> Optional[LayoutDefinition]:
 
 
 def load_custom_layouts(path: str = CUSTOM_LAYOUTS_PATH) -> List[LayoutDefinition]:
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    data = load_json_file(path)
+    if not isinstance(data, dict):
         return []
 
     layouts_raw = data.get("layouts") if isinstance(data, dict) else None
@@ -130,15 +125,4 @@ def save_custom_layouts(layouts: List[LayoutDefinition], path: str = CUSTOM_LAYO
         "schema": 1,
         "layouts": [serialize_layout(layout) for layout in layouts],
     }
-    tmp_path = f"{path}.tmp"
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except OSError:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    atomic_write_json(path, data)

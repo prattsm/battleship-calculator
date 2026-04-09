@@ -1,8 +1,7 @@
-import json
-import os
 from typing import Any, Dict, Optional
 
 from battleship.layouts.definition import LayoutDefinition
+from battleship.persistence.io import atomic_write_json, load_json_file
 
 
 APP_STATE_SCHEMA = 1
@@ -17,13 +16,7 @@ def _default_state() -> Dict[str, Any]:
 
 
 def _load_raw(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return _default_state()
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return _default_state()
+    data = load_json_file(path)
     if not isinstance(data, dict):
         return _default_state()
     if "selected_layout" not in data:
@@ -34,18 +27,7 @@ def _load_raw(path: str) -> Dict[str, Any]:
 
 
 def _write_atomic(path: str, data: Dict[str, Any]) -> None:
-    tmp_path = f"{path}.tmp"
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except OSError:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    atomic_write_json(path, data)
 
 
 def load_selected_layout(path: str) -> Optional[Dict[str, Any]]:

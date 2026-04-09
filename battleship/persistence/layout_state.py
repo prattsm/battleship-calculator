@@ -1,9 +1,8 @@
-import json
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from battleship.layouts.builtins import legacy_layout
 from battleship.layouts.definition import LayoutDefinition
+from battleship.persistence.io import atomic_write_json, load_json_file
 
 
 def layout_key(layout: LayoutDefinition) -> str:
@@ -11,12 +10,8 @@ def layout_key(layout: LayoutDefinition) -> str:
 
 
 def _load_raw(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {"schema": 1, "layouts": {}}
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    data = load_json_file(path)
+    if data is None:
         return {"schema": 1, "layouts": {}}
 
     if isinstance(data, dict) and "layouts" in data and isinstance(data.get("layouts"), dict):
@@ -42,15 +37,7 @@ def save_layout_state(path: str, layout: LayoutDefinition, state: Dict[str, Any]
     data = _load_raw(path)
     layouts = data.setdefault("layouts", {})
     layouts[layout_key(layout)] = state
-    try:
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except OSError:
-        pass
+    atomic_write_json(path, data)
 
 
 def delete_layout_state(path: str, layout: LayoutDefinition) -> None:
@@ -59,11 +46,7 @@ def delete_layout_state(path: str, layout: LayoutDefinition) -> None:
     key = layout_key(layout)
     if key in layouts:
         del layouts[key]
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except OSError:
-        pass
+    atomic_write_json(path, data)
 
 
 def find_layout_versions(path: str, layout_id: str) -> List[Tuple[int, str]]:
